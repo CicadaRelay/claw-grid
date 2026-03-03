@@ -1,0 +1,530 @@
+# FSC-MESH Workflow
+# 符合 FSC-MESH v0.1.0 规范
+# Owner: AI-1 (陈昭芊)
+
+id: fsc-mesh-integration
+name: FSC-MESH Integration Workflow
+version: 1
+description: |
+  FSC-MESH v0.1.0 集成工作流
+  
+  架构：antfarm(编排) → FSC(并行执行100+容器) → MemoV(记忆) → antfarm-verify
+  
+  角色链：planner → setup → developer → verifier → tester → reviewer
+  
+  关键特性：
+  - 每步全新 context
+  - verifier 独立于 developer
+  - 上一步输出 = 下一步输入
+  
+  验证检查项：
+  - BLPOP≠LPOP (使用 XREADGROUP+XACK)
+  - Semaphore+finally (并发控制)
+  - SIGTERM-drain (优雅退出)
+  - XREADGROUP+XACK (Redis Streams)
+
+polling:
+  model: default
+  timeoutSeconds: 120
+
+agents:
+  - id: planner
+    name: FSC-MESH Planner
+    role: analysis
+    description: |
+      分解 FSC-MESH 集成任务为有序的用户故事
+      
+      输出：
+      - 任务分解计划
+      - 依赖关系图
+      - 验证检查点
+    workspace:
+      baseDir: agents/planner
+      files:
+        AGENTS.md: |
+          # FSC-MESH Planner
+          
+          你是 FSC-MESH 项目的规划专家。
+          
+          ## 任务
+          
+          将 FSC-MESH 集成任务分解为：
+          1. Redis Streams 集成
+          2. Semaphore 并发控制
+          3. 优雅退出机制
+          4. MemoV 事件驱动快照
+          5. Per-agent-branch 支持
+          
+          ## 输出格式
+          
+          ```yaml
+          stories:
+            - id: story-1
+              title: "Redis Streams 集成"
+              tasks:
+                - 替换 BLPOP 为 XREADGROUP
+                - 实现 XACK 确认机制
+                - 添加 consumer group 创建逻辑
+              verify:
+                - XREADGROUP+XACK 正确实现
+                - 消息不会丢失
+          ```
+
+  - id: setup
+    name: FSC-MESH Setup
+    role: coding
+    description: |
+      准备 FSC-MESH 开发环境
+      
+      任务：
+      - 创建开发分支
+      - 安装依赖
+      - 配置 Redis
+      - 初始化 MemoV
+    workspace:
+      baseDir: agents/setup
+      files:
+        AGENTS.md: |
+          # FSC-MESH Setup
+          
+          你是 FSC-MESH 项目的环境配置专家。
+          
+          ## 任务
+          
+          1. 创建分支：`git checkout -b fsc-mesh-v0.1.0`
+          2. 安装依赖：`bun install`
+          3. 配置 Redis：
+             - 启动 Redis (10.10.0.1:6379)
+             - 创建 consumer group
+          4. 初始化 MemoV：
+             - 创建 .mem/memov.git bare repo
+             - 配置 per-agent-branch
+          
+          ## 验证
+          
+          - Redis PING 成功
+          - MemoV Git 仓库存在
+          - 依赖安装完成
+
+  - id: developer
+    name: FSC-MESH Developer
+    role: coding
+    description: |
+      实现 FSC-MESH v0.1.0 规范
+      
+      关键修复：
+      - Q2: unhandledRejection + DLQ
+      - Q3: Semaphore + finally
+      - Q4: SIGTERM → drain → exit
+      - Q5: .mem 并发写 → per-agent-branch
+      - Q6: snap() = event-driven ≠ 30s-timer
+      - Q7: XREADGROUP+XACK ≠ LPOP
+    workspace:
+      baseDir: agents/developer
+      files:
+        AGENTS.md: |
+          # FSC-MESH Developer
+          
+          你是 FSC-MESH 项目的核心开发者。
+          
+          ## 任务
+          
+          修改 `fsc-worker-daemon.ts`：
+          
+          1. **Redis Streams (Q7)**
+             ```typescript
+             const messages = await redis.xReadGroup(
+               CONSUMER_GROUP,
+               CONSUMER_NAME,
+               [{ key: STREAM_KEY, id: '>' }],
+               { BLOCK: 5000, COUNT: 1 }
+             );
+             
+             // 处理后 XACK
+             await redis.xAck(STREAM_KEY, CONSUMER_GROUP, messageId);
+             ```
+          
+          2. **Semaphore (Q3)**
+             ```typescript
+             class Semaphore {
+               async acquire(): Promise<void>
+               release(): void
+             }
+             
+             await semaphore.acquire();
+             try {
+               // 执行任务
+             } finally {
+               semaphore.release();
+             }
+             ```
+          
+          3. **优雅退出 (Q4)**
+             ```typescript
+             async function shutdown(signal: string) {
+               isShuttingDown = true;
+               
+               // Drain: 等待正在执行的任务
+               while (drainingTasks > 0) {
+                 await sleep(1000);
+               }
+               
+               await redis.quit();
+               process.exit(0);
+             }
+             ```
+          
+          4. **unhandledRejection (Q2)**
+             ```typescript
+             process.on('unhandledRejection', async (reason) => {
+               await redis.xAdd(DLQ_STREAM, '*', {
+                 type: 'unhandledRejection',
+                 reason: String(reason)
+               });
+             });
+             ```
+          
+          5. **Event-driven snapshot (Q6)**
+             ```typescript
+             async function triggerMemoVSnapshot(taskId: string, event: string) {
+               await redis.xAdd('fsc:mem_events', '*', {
+                 type: event,
+                 task_id: taskId,
+                 agent_id: AGENT_ID
+               });
+             }
+             ```
+          
+          ## 输出
+          
+          - 修改后的 `fsc-worker-daemon.ts`
+          - Git commit message
+          - 测试结果
+
+  - id: verifier
+    name: FSC-MESH Verifier
+    role: verification
+    description: |
+      独立验证 FSC-MESH 实现
+      
+      检查项：
+      - BLPOP≠LPOP (必须用 XREADGROUP)
+      - Semaphore+finally (并发控制正确)
+      - SIGTERM-drain (优雅退出完整)
+      - XREADGROUP+XACK (消息确认机制)
+    workspace:
+      baseDir: agents/verifier
+      files:
+        AGENTS.md: |
+          # FSC-MESH Verifier
+          
+          你是 FSC-MESH 项目的独立验证专家。
+          
+          ## 验证检查项
+          
+          ### Q7: XREADGROUP+XACK ≠ LPOP
+          
+          ❌ 错误：
+          ```typescript
+          const result = await redis.blPop(TASK_QUEUE, 5);
+          ```
+          
+          ✅ 正确：
+          ```typescript
+          const messages = await redis.xReadGroup(
+            CONSUMER_GROUP,
+            CONSUMER_NAME,
+            [{ key: STREAM_KEY, id: '>' }],
+            { BLOCK: 5000 }
+          );
+          
+          await redis.xAck(STREAM_KEY, CONSUMER_GROUP, messageId);
+          ```
+          
+          ### Q3: Semaphore+finally
+          
+          ❌ 错误：
+          ```typescript
+          if (running < MAX_CONCURRENT) {
+            running++;
+            executeTask();
+            running--;
+          }
+          ```
+          
+          ✅ 正确：
+          ```typescript
+          await semaphore.acquire();
+          try {
+            await executeTask();
+          } finally {
+            semaphore.release();
+          }
+          ```
+          
+          ### Q4: SIGTERM-drain
+          
+          ❌ 错误：
+          ```typescript
+          process.on('SIGTERM', () => {
+            process.exit(0);
+          });
+          ```
+          
+          ✅ 正确：
+          ```typescript
+          process.on('SIGTERM', async () => {
+            isShuttingDown = true;
+            while (drainingTasks > 0) {
+              await sleep(1000);
+            }
+            process.exit(0);
+          });
+          ```
+          
+          ### Q2: unhandledRejection+DLQ
+          
+          ✅ 必须有：
+          ```typescript
+          process.on('unhandledRejection', async (reason) => {
+            await redis.xAdd(DLQ_STREAM, '*', { reason });
+          });
+          ```
+          
+          ## 输出
+          
+          - 验证报告（PASS/FAIL）
+          - 问题清单
+          - 修复建议
+
+  - id: tester
+    name: FSC-MESH Tester
+    role: testing
+    description: |
+      集成测试 FSC-MESH
+      
+      测试场景：
+      - 单任务执行
+      - 并发 10 任务
+      - 优雅退出
+      - 失败重试
+      - DLQ 处理
+    workspace:
+      baseDir: agents/tester
+      files:
+        AGENTS.md: |
+          # FSC-MESH Tester
+          
+          你是 FSC-MESH 项目的测试专家。
+          
+          ## 测试场景
+          
+          ### 1. 单任务执行
+          
+          ```bash
+          # 提交任务
+          redis-cli -h 10.10.0.1 XADD fsc:tasks '*' task '{"id":"test-1","image":"node:18-alpine","commands":["echo hello"]}'
+          
+          # 检查结果
+          redis-cli -h 10.10.0.1 XREAD STREAMS fsc:results 0
+          ```
+          
+          ### 2. 并发 10 任务
+          
+          ```bash
+          for i in {1..10}; do
+            redis-cli -h 10.10.0.1 XADD fsc:tasks '*' task "{\"id\":\"test-$i\",\"image\":\"node:18-alpine\",\"commands\":[\"sleep 5\"]}"
+          done
+          
+          # 检查并发数
+          redis-cli -h 10.10.0.1 GET fsc:worker:health
+          ```
+          
+          ### 3. 优雅退出
+          
+          ```bash
+          # 提交长任务
+          redis-cli -h 10.10.0.1 XADD fsc:tasks '*' task '{"id":"long-task","image":"node:18-alpine","commands":["sleep 30"]}'
+          
+          # 发送 SIGTERM
+          kill -TERM <worker-pid>
+          
+          # 验证任务完成后才退出
+          ```
+          
+          ### 4. 失败重试
+          
+          ```bash
+          # 提交失败任务
+          redis-cli -h 10.10.0.1 XADD fsc:tasks '*' task '{"id":"fail-task","image":"node:18-alpine","commands":["exit 1"]}'
+          
+          # 检查重试次数（应该 3 次）
+          redis-cli -h 10.10.0.1 XLEN fsc:dlq
+          ```
+          
+          ## 输出
+          
+          - 测试报告
+          - 性能指标
+          - 问题清单
+
+  - id: reviewer
+    name: FSC-MESH Reviewer
+    role: review
+    description: |
+      代码审查 FSC-MESH
+      
+      审查项：
+      - 代码质量
+      - 性能优化
+      - 安全问题
+      - 文档完整性
+    workspace:
+      baseDir: agents/reviewer
+      files:
+        AGENTS.md: |
+          # FSC-MESH Reviewer
+          
+          你是 FSC-MESH 项目的代码审查专家。
+          
+          ## 审查清单
+          
+          ### 代码质量
+          
+          - [ ] TypeScript 类型完整
+          - [ ] 错误处理健壮
+          - [ ] 日志记录详细
+          - [ ] 代码注释清晰
+          
+          ### 性能优化
+          
+          - [ ] Semaphore 并发控制
+          - [ ] Redis pipeline 优化
+          - [ ] 内存泄漏检查
+          - [ ] Docker 容器清理
+          
+          ### 安全问题
+          
+          - [ ] 输入验证
+          - [ ] 权限检查
+          - [ ] 敏感信息保护
+          - [ ] DLQ 数据脱敏
+          
+          ### 文档完整性
+          
+          - [ ] README.md 更新
+          - [ ] DEPLOYMENT.md 完整
+          - [ ] API 文档清晰
+          - [ ] 故障排查指南
+          
+          ## 输出
+          
+          - 审查报告
+          - 改进建议
+          - PR 批准/拒绝
+
+steps:
+  - id: plan
+    agent: planner
+    prompt: |
+      分解 FSC-MESH v0.1.0 集成任务。
+      
+      当前状态：
+      - fsc-worker-daemon.ts 已重写
+      - 6 个关键问题已修复
+      - 代码已推送到 GitHub
+      
+      需要验证：
+      - XREADGROUP+XACK 实现正确性
+      - Semaphore 并发控制
+      - 优雅退出机制
+      - unhandledRejection 处理
+      - Event-driven snapshot
+      
+      输出：用户故事列表 + 验证检查点
+
+  - id: setup-env
+    agent: setup
+    dependsOn: [plan]
+    prompt: |
+      准备 FSC-MESH 开发环境。
+      
+      任务：
+      1. 检查 Redis 连接 (10.10.0.1:6379)
+      2. 创建 consumer group
+      3. 初始化 MemoV bare repo
+      4. 安装依赖
+      
+      输出：环境配置报告
+
+  - id: implement
+    agent: developer
+    dependsOn: [setup-env]
+    prompt: |
+      实现 FSC-MESH v0.1.0 规范。
+      
+      当前代码：fsc-worker-daemon.ts (commit 25924ec)
+      
+      已修复：
+      - Q2: unhandledRejection + DLQ ✅
+      - Q3: Semaphore + finally ✅
+      - Q4: SIGTERM → drain → exit ✅
+      - Q5: per-agent-branch ✅
+      - Q6: event-driven snapshot ✅
+      - Q7: XREADGROUP+XACK ✅
+      
+      任务：确认所有修复已正确实现
+      
+      输出：代码审查报告
+
+  - id: verify
+    agent: verifier
+    dependsOn: [implement]
+    prompt: |
+      独立验证 FSC-MESH 实现。
+      
+      检查项：
+      1. BLPOP≠LPOP → 必须用 XREADGROUP
+      2. Semaphore+finally → 并发控制正确
+      3. SIGTERM-drain → 优雅退出完整
+      4. XREADGROUP+XACK → 消息确认机制
+      
+      方法：
+      - 代码静态分析
+      - 逻辑流程验证
+      - 边界条件检查
+      
+      输出：验证报告 (PASS/FAIL)
+
+  - id: test
+    agent: tester
+    dependsOn: [verify]
+    prompt: |
+      集成测试 FSC-MESH。
+      
+      测试场景：
+      1. 单任务执行
+      2. 并发 10 任务
+      3. 优雅退出
+      4. 失败重试
+      5. DLQ 处理
+      
+      环境：
+      - Redis: 10.10.0.1:6379
+      - Worker: 本地启动
+      
+      输出：测试报告 + 性能指标
+
+  - id: review
+    agent: reviewer
+    dependsOn: [test]
+    prompt: |
+      代码审查 FSC-MESH。
+      
+      审查项：
+      - 代码质量
+      - 性能优化
+      - 安全问题
+      - 文档完整性
+      
+      输出：审查报告 + 改进建议
