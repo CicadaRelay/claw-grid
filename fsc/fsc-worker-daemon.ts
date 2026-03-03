@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
 /**
- * FSC Worker Daemon
- * 基于 QWEN A2A_TASK_SPEC v1.0
+ * FSC Worker Daemon v0.1.0
+ * 符合 FSC-MESH 规范
  * 
- * 功能：
- * - 从 Redis 队列拉取任务（BLPOP）
- * - 执行 FSC Docker 实例
- * - 推送结果到 Redis
- * - 错误处理、重试、优雅退出
+ * 修复：
+ * - Redis Streams (XREADGROUP+XACK) 替代 BLPOP
+ * - Semaphore 并发控制 + finally 释放
+ * - unhandledRejection + DLQ
+ * - SIGTERM → drain → exit
+ * - MemoV per-agent-branch
+ * - Event-driven snapshot
  */
 
 import { createClient } from 'redis';
@@ -17,12 +19,14 @@ import winston from 'winston';
 // ============ 配置 ============
 const REDIS_HOST = process.env.REDIS_HOST || '10.10.0.1';
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
-const TASK_QUEUE = 'fsc:task_queue';
-const RESULT_QUEUE = 'fsc:result_queue';
-const FAILED_QUEUE = 'fsc:failed_tasks';
+const STREAM_KEY = 'fsc:tasks';
+const CONSUMER_GROUP = 'fsc-workers';
+const CONSUMER_NAME = `worker-${process.env.HOSTNAME || 'unknown'}`;
+const RESULT_STREAM = 'fsc:results';
+const DLQ_STREAM = 'fsc:dlq';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '10');
 const RETRY_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 1000;
+const AGENT_ID = process.env.AGENT_ID || CONSUMER_NAME;
 
 // ============ Logger ============
 const logger = winston.createLogger({
@@ -42,6 +46,42 @@ const logger = winston.createLogger({
   ]
 });
 
+// ============ Semaphore ============
+class Semaphore {
+  private permits: number;
+  private queue: Array<() => void> = [];
+  
+  constructor(permits: number) {
+    this.permits = permits;
+  }
+  
+  async acquire(): Promise<void> {
+    if (this.permits > 0) {
+      this.permits--;
+      return;
+    }
+    
+    return new Promise<void>(resolve => {
+      this.queue.push(resolve);
+    });
+  }
+  
+  release(): void {
+    this.permits++;
+    const next = this.queue.shift();
+    if (next) {
+      this.permits--;
+      next();
+    }
+  }
+  
+  available(): number {
+    return this.permits;
+  }
+}
+
+const semaphore = new Semaphore(MAX_CONCURRENT);
+
 // ============ Redis Client ============
 const redis = createClient({
   socket: {
@@ -60,6 +100,22 @@ const redis = createClient({
 redis.on('error', (err) => logger.error('Redis error:', err));
 redis.on('connect', () => logger.info('Redis connected'));
 redis.on('reconnecting', () => logger.warn('Redis reconnecting...'));
+
+// ============ 未处理的 Rejection ============
+process.on('unhandledRejection', async (reason, promise) => {
+  logger.error('Unhandled Rejection:', { reason, promise });
+  
+  // 发送到 DLQ
+  try {
+    await redis.xAdd(DLQ_STREAM, '*', {
+      type: 'unhandledRejection',
+      reason: String(reason),
+      timestamp: Date.now().toString()
+    });
+  } catch (err) {
+    logger.error('Failed to send to DLQ:', err);
+  }
+});
 
 // ============ 任务执行 ============
 interface Task {
@@ -97,6 +153,9 @@ async function executeTask(task: Task): Promise<TaskResult> {
     const duration = Date.now() - startTime;
     logger.info(`[Task ${task.id}] Completed in ${duration}ms`);
     
+    // Event-driven MemoV snapshot
+    await triggerMemoVSnapshot(task.id, 'task_complete');
+    
     return {
       taskId: task.id,
       status: result.status === 'success' ? 'success' : 
@@ -119,82 +178,131 @@ async function executeTask(task: Task): Promise<TaskResult> {
   }
 }
 
+// ============ Event-driven MemoV Snapshot ============
+async function triggerMemoVSnapshot(taskId: string, event: string) {
+  try {
+    await redis.xAdd('fsc:mem_events', '*', {
+      type: event,
+      task_id: taskId,
+      agent_id: AGENT_ID,
+      timestamp: Date.now().toString()
+    });
+    
+    logger.debug(`[MemoV] Snapshot triggered: ${event} for task ${taskId}`);
+  } catch (err) {
+    logger.error('[MemoV] Failed to trigger snapshot:', err);
+  }
+}
+
 // ============ 重试逻辑 ============
-async function executeWithRetry(task: Task, attempt = 1): Promise<TaskResult> {
+async function executeWithRetry(task: Task, messageId: string, attempt = 1): Promise<TaskResult> {
   const result = await executeTask(task);
   
   if (result.status === 'failure' && attempt < RETRY_ATTEMPTS) {
     logger.warn(`[Task ${task.id}] Retry ${attempt}/${RETRY_ATTEMPTS}`);
-    await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * attempt));
-    return executeWithRetry(task, attempt + 1);
+    
+    // Exponential backoff
+    const delay = Math.pow(2, attempt) * 1000;
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    return executeWithRetry(task, messageId, attempt + 1);
+  }
+  
+  // 如果最终失败，发送到 DLQ
+  if (result.status === 'failure' && attempt >= RETRY_ATTEMPTS) {
+    await redis.xAdd(DLQ_STREAM, '*', {
+      task_id: task.id,
+      message_id: messageId,
+      error: result.error || 'unknown',
+      attempts: attempt.toString(),
+      timestamp: Date.now().toString()
+    });
+    
+    logger.error(`[Task ${task.id}] Moved to DLQ after ${attempt} attempts`);
   }
   
   return result;
 }
 
-// ============ 并发控制 ============
-class WorkerPool {
-  private running = 0;
-  private queue: Array<() => Promise<void>> = [];
-  
-  async execute(fn: () => Promise<void>) {
-    if (this.running >= MAX_CONCURRENT) {
-      await new Promise<void>(resolve => this.queue.push(resolve));
-    }
-    
-    this.running++;
-    try {
-      await fn();
-    } finally {
-      this.running--;
-      const next = this.queue.shift();
-      if (next) next();
-    }
-  }
-  
-  getRunning() {
-    return this.running;
-  }
-}
-
-const pool = new WorkerPool();
-
 // ============ 主循环 ============
 let isShuttingDown = false;
+let drainingTasks = 0;
 
 async function mainLoop() {
-  logger.info('FSC Worker Daemon starting...');
+  logger.info('FSC Worker Daemon v0.1.0 starting...');
   logger.info(`Redis: ${REDIS_HOST}:${REDIS_PORT}`);
+  logger.info(`Consumer: ${CONSUMER_GROUP}/${CONSUMER_NAME}`);
   logger.info(`Max concurrent: ${MAX_CONCURRENT}`);
+  logger.info(`Agent ID: ${AGENT_ID}`);
   
   await redis.connect();
   
+  // 创建 consumer group（如果不存在）
+  try {
+    await redis.xGroupCreate(STREAM_KEY, CONSUMER_GROUP, '0', {
+      MKSTREAM: true
+    });
+    logger.info(`Consumer group created: ${CONSUMER_GROUP}`);
+  } catch (err: any) {
+    if (err.message.includes('BUSYGROUP')) {
+      logger.info(`Consumer group already exists: ${CONSUMER_GROUP}`);
+    } else {
+      throw err;
+    }
+  }
+  
   while (!isShuttingDown) {
     try {
-      // BLPOP 阻塞等待任务（5秒超时）
-      const result = await redis.blPop(TASK_QUEUE, 5);
+      // XREADGROUP 阻塞读取
+      const messages = await redis.xReadGroup(
+        CONSUMER_GROUP,
+        CONSUMER_NAME,
+        [{ key: STREAM_KEY, id: '>' }],
+        { BLOCK: 5000, COUNT: 1 }
+      );
       
-      if (!result) {
-        // 超时，继续循环
+      if (!messages || messages.length === 0) {
         continue;
       }
       
-      const taskData = JSON.parse(result.element) as Task;
-      logger.info(`[Task ${taskData.id}] Received`);
-      
-      // 异步执行任务（并发控制）
-      pool.execute(async () => {
-        const taskResult = await executeWithRetry(taskData);
-        
-        // 推送结果
-        if (taskResult.status === 'success') {
-          await redis.rPush(RESULT_QUEUE, JSON.stringify(taskResult));
-          logger.info(`[Task ${taskData.id}] Result pushed to ${RESULT_QUEUE}`);
-        } else {
-          await redis.rPush(FAILED_QUEUE, JSON.stringify(taskResult));
-          logger.error(`[Task ${taskData.id}] Failed, moved to ${FAILED_QUEUE}`);
+      for (const { name, messages: streamMessages } of messages) {
+        for (const { id: messageId, message } of streamMessages) {
+          const taskData = JSON.parse(message.task) as Task;
+          logger.info(`[Task ${taskData.id}] Received from stream`);
+          
+          // Semaphore 控制并发
+          await semaphore.acquire();
+          drainingTasks++;
+          
+          // 异步执行任务
+          (async () => {
+            try {
+              const taskResult = await executeWithRetry(taskData, messageId);
+              
+              // 推送结果
+              if (taskResult.status === 'success') {
+                await redis.xAdd(RESULT_STREAM, '*', {
+                  task_id: taskData.id,
+                  status: taskResult.status,
+                  output: taskResult.output || '',
+                  timestamp: taskResult.timestamp.toString()
+                });
+                logger.info(`[Task ${taskData.id}] Result pushed to ${RESULT_STREAM}`);
+              }
+              
+              // XACK 确认消息
+              await redis.xAck(STREAM_KEY, CONSUMER_GROUP, messageId);
+              logger.info(`[Task ${taskData.id}] Message acknowledged`);
+              
+            } catch (error) {
+              logger.error(`[Task ${taskData.id}] Execution error:`, error);
+            } finally {
+              semaphore.release();
+              drainingTasks--;
+            }
+          })();
         }
-      });
+      }
       
     } catch (error) {
       logger.error('Main loop error:', error);
@@ -210,31 +318,36 @@ setInterval(async () => {
   try {
     await redis.set('fsc:worker:health', JSON.stringify({
       timestamp: Date.now(),
-      running: pool.getRunning(),
-      maxConcurrent: MAX_CONCURRENT
+      running: MAX_CONCURRENT - semaphore.available(),
+      maxConcurrent: MAX_CONCURRENT,
+      agentId: AGENT_ID
     }), { EX: 60 });
   } catch (error) {
     logger.error('Health check failed:', error);
   }
 }, 30000);
 
-// ============ 优雅退出 ============
+// ============ 优雅退出 (SIGTERM → drain → exit) ============
 async function shutdown(signal: string) {
   logger.info(`Received ${signal}, shutting down gracefully...`);
   isShuttingDown = true;
   
-  // 等待正在执行的任务完成（最多 30 秒）
+  // Drain: 等待正在执行的任务完成
   const timeout = setTimeout(() => {
     logger.warn('Shutdown timeout, forcing exit');
     process.exit(1);
   }, 30000);
   
-  while (pool.getRunning() > 0) {
-    logger.info(`Waiting for ${pool.getRunning()} tasks to complete...`);
+  while (drainingTasks > 0) {
+    logger.info(`Draining... ${drainingTasks} tasks remaining`);
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
   
   clearTimeout(timeout);
+  
+  // 触发最终 snapshot
+  await triggerMemoVSnapshot('shutdown', 'worker_shutdown');
+  
   await redis.quit();
   logger.info('Shutdown complete');
   process.exit(0);
