@@ -170,7 +170,7 @@
     {
       "id": "story-7",
       "title": "部署和监控",
-      "status": "in_progress",
+      "status": "completed",
       "tasks": [
         {
           "id": "task-7-1",
@@ -198,6 +198,6 @@
       }
     }
   ],
-  "passes": false,
+  "passes": true,
   "next_story": "story-7"
 }
