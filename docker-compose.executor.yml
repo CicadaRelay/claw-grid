@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  fsc-executor:
+    image: clawmesh/fsc-executor:latest
+    container_name: fsc-executor
+    restart: unless-stopped
+    environment:
+      - MEM_DIR=/data/.mem
+      - MAX_PARALLEL=10
+      - REDIS_HOST=10.0.0.1
+      - REDIS_PORT=6379
+      - NODE_NAME=tokyo
+    volumes:
+      - .mem:/data/.mem
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - claw-mesh
+    deploy:
+      placement:
+        constraints:
+          - node.labels.role == executor
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  claw-mesh:
+    external: true
