@@ -1,0 +1,20 @@
+{
+  "name": "claw-mesh",
+  "version": "1.0.0",
+  "description": "CLAW Mesh - WireGuard 全网状 VPN + AI 集群调度器",
+  "main": "index.js",
+  "scripts": {
+    "ontology:init": "node memov/ontology-init.js",
+    "ontology:search": "node -e \"const { Ontology } = require('./memov/ontology'); const o = new Ontology(); o.initVectorStore().then(() => o.search(process.argv[1])).then(console.log)\"",
+    "causal:analyze": "node -e \"const { CausalAnalyzer } = require('./memov/causal'); const a = new CausalAnalyzer(); a.addEvent('test', 'test', 'failure', {}); console.log(a.rootCauseAnalysis('test'))\"",
+    "ralph:verify": "bash scripts/ralph.sh"
+  },
+  "keywords": ["wireguard", "mesh", "ai", "cluster", "fsc", "memov"],
+  "author": "CLAW Mesh Team",
+  "license": "MIT",
+  "dependencies": {
+    "@langchain/core": "^0.1.0",
+    "langchain": "^0.1.0",
+    "@langchain/openai": "^0.0.1"
+  }
+}
