@@ -8,7 +8,16 @@
     "causal:analyze": "node -e \"const c=require('./memory/causal');const f=c.diagnoseFailure('manual',process.argv[1]);console.log(JSON.stringify(f,null,2))\" --",
     "ralph": "bash scripts/ralph.sh"
   },
-  "keywords": ["fsc", "wireguard", "memov", "redis"],
+  "keywords": [
+    "fsc",
+    "wireguard",
+    "memov",
+    "redis"
+  ],
   "author": "AI-1 (陈昭芊)",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "redis": "^5.11.0",
+    "typescript": "^5.9.3"
+  }
 }
