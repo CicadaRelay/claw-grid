@@ -102,8 +102,10 @@ export class QualityJudge {
     if (lintPassed) score += 10;
 
     // 测试通过 (+15)
+    // 支持 "0 failed" / "0 fail" 格式——只在有实际失败数 > 0 时算失败
     const testPassed = !input.testOutput ||
-      (input.testOutput.includes('pass') && !input.testOutput.includes('fail'));
+      (input.testOutput.includes('pass') &&
+       !/[1-9]\d*\s*fail/i.test(input.testOutput));
     details.push({
       check: 'tests',
       passed: testPassed,
@@ -147,15 +149,15 @@ export class QualityJudge {
     // diff 大小合理 (+5, ≤500 行)
     const diffLines = input.gitDiff ? input.gitDiff.split('\n').length : 0;
     const sizeOk = diffLines <= 500;
+    const sizeScore = sizeOk ? 5 : Math.max(0, 5 - Math.ceil((diffLines - 500) / 100));
     details.push({
       check: 'diff_size',
       passed: sizeOk,
-      score: sizeOk ? 5 : Math.max(0, 5 - Math.floor((diffLines - 500) / 200)),
+      score: sizeScore,
       maxScore: 5,
       message: `Diff: ${diffLines} lines (limit: 500)`,
     });
-    if (sizeOk) score += 5;
-    else score += Math.max(0, 5 - Math.floor((diffLines - 500) / 200));
+    score += sizeScore;
 
     // 只改了指定文件 (+10)
     if (input.allowedFiles && input.allowedFiles.length > 0) {

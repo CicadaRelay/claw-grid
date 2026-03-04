@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "description": "FSC-MESH: WireGuard + FSC + MemoV + Redis Streams",
   "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
     "ontology:init": "node memory/ontology-init.js",
     "ontology:query": "node -e \"const o=require('./memory/ontology');console.log(JSON.stringify(o.query({type:process.argv[1]}),null,2))\" --",
     "causal:analyze": "node -e \"const c=require('./memory/causal');const f=c.diagnoseFailure('manual',process.argv[1]);console.log(JSON.stringify(f,null,2))\" --",
@@ -18,6 +20,7 @@
   "license": "MIT",
   "devDependencies": {
     "redis": "^5.11.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }
