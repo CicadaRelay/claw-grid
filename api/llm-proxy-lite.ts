@@ -55,11 +55,14 @@ function loadProviders(): Provider[] {
 
     for (const [name, p] of Object.entries(ocProviders) as any) {
       if (p.apiKey && !providers.find(x => x.name === name)) {
+        // models 可能是 string[] 或 {id: string}[]
+        const rawModels = p.models || [];
+        const modelIds = rawModels.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
         providers.push({
           name,
           baseUrl: p.baseUrl || '',
           apiKey: p.apiKey,
-          models: p.models || [],
+          models: modelIds,
           api: p.api?.includes('anthropic') ? 'anthropic' : 'openai',
         });
       }
