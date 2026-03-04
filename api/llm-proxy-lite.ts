@@ -20,8 +20,8 @@ interface Provider {
   api: 'openai' | 'anthropic';
 }
 
-// 从 openclaw.json 加载提供商 (如果存在)
-function loadProviders(): Provider[] {
+// 从 openclaw.json 同步加载提供商
+function loadProvidersSync(): Provider[] {
   const providers: Provider[] = [];
 
   // 1. 环境变量优先
@@ -45,34 +45,43 @@ function loadProviders(): Provider[] {
     });
   }
 
-  // 2. 从 openclaw.json 补充
-  try {
-    const home = process.env.HOME || '/root';
-    const configPath = `${home}/.openclaw/openclaw.json`;
-    const config = JSON.parse(require('fs').readFileSync(configPath, 'utf-8'));
-    const modelsSection = config.models || {};
-    const ocProviders = modelsSection.providers || config.providers || {};
+  // 2. 从 openclaw.json 补充 (使用 Bun 原生文件 API)
+  const home = process.env.HOME || '/root';
+  const configPath = `${home}/.openclaw/openclaw.json`;
+  const file = Bun.file(configPath);
 
-    for (const [name, p] of Object.entries(ocProviders) as any) {
-      if (p.apiKey && !providers.find(x => x.name === name)) {
-        // models 可能是 string[] 或 {id: string}[]
-        const rawModels = p.models || [];
-        const modelIds = rawModels.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
-        providers.push({
-          name,
-          baseUrl: p.baseUrl || '',
-          apiKey: p.apiKey,
-          models: modelIds,
-          api: p.api?.includes('anthropic') ? 'anthropic' : 'openai',
-        });
+  if (file.size > 0) {
+    try {
+      const text = require('fs').readFileSync(configPath, 'utf-8');
+      const config = JSON.parse(text);
+      const modelsSection = config.models || {};
+      const ocProviders = modelsSection.providers || config.providers || {};
+
+      for (const [name, p] of Object.entries(ocProviders) as any) {
+        if (p.apiKey && !providers.find(x => x.name === name)) {
+          const rawModels = p.models || [];
+          const modelIds = rawModels.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
+          providers.push({
+            name,
+            baseUrl: p.baseUrl || '',
+            apiKey: p.apiKey,
+            models: modelIds,
+            api: p.api?.includes('anthropic') ? 'anthropic' : 'openai',
+          });
+        }
       }
+      console.log(`[LLM Proxy] Loaded ${Object.keys(ocProviders).length} providers from ${configPath}`);
+    } catch (e: any) {
+      console.error('[LLM Proxy] Config load error:', e.message);
     }
-  } catch (e: any) { console.error('[LLM Proxy] Config load error:', e.message); }
+  } else {
+    console.log(`[LLM Proxy] Config not found: ${configPath}`);
+  }
 
   return providers;
 }
 
-const providers = loadProviders();
+const providers = loadProvidersSync();
 console.log(`[LLM Proxy] Loaded ${providers.length} providers: ${providers.map(p => p.name).join(', ')}`);
 
 // 简单令牌桶
