@@ -2,16 +2,44 @@
 /**
  * LLM Proxy Lite — 零依赖轻量版
  *
- * 用于 FSC Agent 容器调用廉价模型
- * 支持 Doubao / MiniMax / OpenAI-compatible API
+ * 用于 FSC Agent 容器调用廉价模型 + 结果上报到 Redis
+ * 支持 Doubao / MiniMax / OpenAI-compatible / Anthropic API
  *
  * 启动: bun run api/llm-proxy-lite.ts
- * 调用: POST http://10.10.0.1:3002/v1/chat/completions
+ *
+ * 端点:
+ *   POST /v1/chat/completions  — LLM 调用 (令牌桶限流)
+ *   POST /v1/report            — Agent 结果上报到 Redis Streams
+ *   GET  /health               — 健康检查
+ *   GET  /stats                — 统计信息
  */
+
+import { createClient, type RedisClientType } from 'redis';
 
 const PORT = parseInt(process.env.LLM_PROXY_PORT || '3002');
 
-// 模型提供商配置 (从环境变量或 openclaw.json 读取)
+// ============ Redis 连接 ============
+const REDIS_HOST = process.env.REDIS_HOST || '10.10.0.1';
+const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD || 'fsc-mesh-2026';
+
+let redis: RedisClientType | null = null;
+
+async function getRedis(): Promise<RedisClientType> {
+  if (redis && redis.isOpen) return redis;
+  redis = createClient({
+    url: `redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}`,
+  });
+  redis.on('error', (err) => console.error('[Redis] Error:', err.message));
+  await redis.connect();
+  console.log('[Redis] Connected');
+  return redis;
+}
+
+// 异步初始化 Redis (不阻塞启动)
+getRedis().catch((e) => console.error('[Redis] Init failed:', e.message));
+
+// ============ Provider 配置 ============
 interface Provider {
   name: string;
   baseUrl: string;
@@ -20,11 +48,9 @@ interface Provider {
   api: 'openai' | 'anthropic';
 }
 
-// 从 openclaw.json 同步加载提供商
 function loadProvidersSync(): Provider[] {
   const providers: Provider[] = [];
 
-  // 1. 环境变量优先
   if (process.env.DOUBAO_API_KEY) {
     providers.push({
       name: 'volcengine',
@@ -45,34 +71,33 @@ function loadProvidersSync(): Provider[] {
     });
   }
 
-  // 2. 从 openclaw.json 补充
   const home = process.env.HOME || '/root';
   const configPath = `${home}/.openclaw/openclaw.json`;
 
   try {
     const { readFileSync } = require('node:fs');
     const text = readFileSync(configPath, 'utf-8');
-      const config = JSON.parse(text);
-      const modelsSection = config.models || {};
-      const ocProviders = modelsSection.providers || config.providers || {};
+    const config = JSON.parse(text);
+    const modelsSection = config.models || {};
+    const ocProviders = modelsSection.providers || config.providers || {};
 
-      for (const [name, p] of Object.entries(ocProviders) as any) {
-        if (p.apiKey && !providers.find(x => x.name === name)) {
-          const rawModels = p.models || [];
-          const modelIds = rawModels.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
-          providers.push({
-            name,
-            baseUrl: p.baseUrl || '',
-            apiKey: p.apiKey,
-            models: modelIds,
-            api: p.api?.includes('anthropic') ? 'anthropic' : 'openai',
-          });
-        }
+    for (const [name, p] of Object.entries(ocProviders) as any) {
+      if (p.apiKey && !providers.find(x => x.name === name)) {
+        const rawModels = p.models || [];
+        const modelIds = rawModels.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
+        providers.push({
+          name,
+          baseUrl: p.baseUrl || '',
+          apiKey: p.apiKey,
+          models: modelIds,
+          api: p.api?.includes('anthropic') ? 'anthropic' : 'openai',
+        });
       }
-      console.log(`[LLM Proxy] Loaded ${Object.keys(ocProviders).length} providers from ${configPath}`);
-    } catch (e: any) {
-      console.error(`[LLM Proxy] Config load error: ${e.message} (path: ${configPath})`);
     }
+    console.log(`[LLM Proxy] Loaded ${Object.keys(ocProviders).length} providers from ${configPath}`);
+  } catch (e: any) {
+    console.error(`[LLM Proxy] Config load error: ${e.message} (path: ${configPath})`);
+  }
 
   return providers;
 }
@@ -80,36 +105,32 @@ function loadProvidersSync(): Provider[] {
 const providers = loadProvidersSync();
 console.log(`[LLM Proxy] Loaded ${providers.length} providers: ${providers.map(p => p.name).join(', ')}`);
 
-// 简单令牌桶
-let tokens = 30;
-const MAX_TOKENS = 30;
-const REFILL_RATE = 5; // 每秒
+// ============ 令牌桶限流 (适配 100+ 并发) ============
+let tokens = 100;
+const MAX_TOKENS = 100;
+const REFILL_RATE = 20; // 每秒补 20
 setInterval(() => { tokens = Math.min(MAX_TOKENS, tokens + REFILL_RATE); }, 1000);
 
-// 请求计数
+// ============ 统计 ============
 let totalRequests = 0;
 let totalErrors = 0;
+let totalReports = 0;
 
-// 找到支持指定模型的提供商
+// ============ Provider 路由 ============
 function findProvider(model: string): Provider | null {
-  // 精确匹配
   for (const p of providers) {
     if (p.models.includes(model)) return p;
   }
-  // 模糊匹配
   for (const p of providers) {
     if (p.models.some(m => model.includes(m) || m.includes(model))) return p;
   }
-  // 返回第一个可用的
   return providers[0] || null;
 }
 
-// 转发请求到上游
+// ============ 上游请求 ============
 async function proxyRequest(provider: Provider, body: any): Promise<Response> {
   if (provider.api === 'anthropic') {
-    // Anthropic Messages API 格式
     const url = `${provider.baseUrl}/v1/messages`;
-    const messages = body.messages || [];
     const resp = await fetch(url, {
       method: 'POST',
       headers: {
@@ -120,10 +141,9 @@ async function proxyRequest(provider: Provider, body: any): Promise<Response> {
       body: JSON.stringify({
         model: body.model,
         max_tokens: body.max_tokens || 4000,
-        messages,
+        messages: body.messages || [],
       }),
     });
-    // 转换 Anthropic 响应为 OpenAI 格式
     const data: any = await resp.json();
     if (data.content) {
       return Response.json({
@@ -135,7 +155,6 @@ async function proxyRequest(provider: Provider, body: any): Promise<Response> {
     return Response.json(data, { status: resp.status });
   }
 
-  // OpenAI 兼容格式
   const url = `${provider.baseUrl}/chat/completions`;
   const resp = await fetch(url, {
     method: 'POST',
@@ -145,10 +164,10 @@ async function proxyRequest(provider: Provider, body: any): Promise<Response> {
     },
     body: JSON.stringify(body),
   });
-
   return resp;
 }
 
+// ============ HTTP Server ============
 const server = Bun.serve({
   port: PORT,
   hostname: '0.0.0.0',
@@ -156,31 +175,67 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    // Health check
+    // --- Health ---
     if (url.pathname === '/health') {
+      const redisOk = redis?.isOpen ?? false;
       return Response.json({
         status: 'ok',
         providers: providers.length,
+        redis: redisOk,
         tokens_remaining: tokens,
         total_requests: totalRequests,
         total_errors: totalErrors,
+        total_reports: totalReports,
       });
     }
 
-    // Stats
+    // --- Stats ---
     if (url.pathname === '/stats') {
       return Response.json({
         providers: providers.map(p => ({ name: p.name, models: p.models })),
         rate_limit: { tokens, max: MAX_TOKENS, refill_per_sec: REFILL_RATE },
-        requests: { total: totalRequests, errors: totalErrors },
+        requests: { total: totalRequests, errors: totalErrors, reports: totalReports },
       });
     }
 
-    // Chat completions
+    // --- Agent 结果上报 ---
+    if (url.pathname === '/v1/report' && req.method === 'POST') {
+      totalReports++;
+      try {
+        const body = await req.json();
+        const r = await getRedis();
+
+        // 写入 fsc:results
+        await r.xAdd('fsc:results', '*', {
+          task_id: body.task_id || 'unknown',
+          agent_id: body.agent_id || 'unknown',
+          status: body.status || 'unknown',
+          exit_code: String(body.exit_code ?? -1),
+          model: body.model || '',
+          result_preview: String(body.result_preview || '').slice(0, 500),
+          duration_ms: String(body.duration_ms ?? 0),
+        });
+
+        // 写入 fsc:events
+        await r.xAdd('fsc:events', '*', {
+          type: body.status === 'success' ? 'task_complete' : 'task_failed',
+          agent_id: body.agent_id || 'unknown',
+          task_id: body.task_id || 'unknown',
+          model: body.model || '',
+        });
+
+        return Response.json({ ok: true });
+      } catch (err: any) {
+        totalErrors++;
+        console.error(`[Report] Error: ${err.message}`);
+        return Response.json({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // --- Chat Completions ---
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       totalRequests++;
 
-      // 限流
       if (tokens <= 0) {
         totalErrors++;
         return Response.json({ error: 'Rate limited, retry later' }, { status: 429 });
@@ -197,9 +252,7 @@ const server = Bun.serve({
           return Response.json({ error: 'No provider available' }, { status: 503 });
         }
 
-        // 强制 token 上限
-        const maxTokens = Math.min(body.max_tokens || 4000, 4000);
-        body.max_tokens = maxTokens;
+        body.max_tokens = Math.min(body.max_tokens || 4000, 4000);
 
         const resp = await proxyRequest(provider, body);
         const data = await resp.json();
@@ -222,7 +275,6 @@ const server = Bun.serve({
 });
 
 console.log(`[LLM Proxy Lite] Running on http://0.0.0.0:${PORT}`);
-console.log(`[LLM Proxy Lite] Endpoints:`);
-console.log(`  POST /v1/chat/completions`);
-console.log(`  GET  /health`);
-console.log(`  GET  /stats`);
+console.log(`  POST /v1/chat/completions  — LLM 调用`);
+console.log(`  POST /v1/report            — Agent 结果上报`);
+console.log(`  GET  /health | /stats`);
