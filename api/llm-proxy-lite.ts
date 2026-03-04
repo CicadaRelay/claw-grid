@@ -47,9 +47,11 @@ function loadProviders(): Provider[] {
 
   // 2. 从 openclaw.json 补充
   try {
-    const configPath = `${Bun.env.HOME}/.openclaw/openclaw.json`;
+    const home = Bun.env.HOME || '/root';
+    const configPath = `${home}/.openclaw/openclaw.json`;
     const config = JSON.parse(require('fs').readFileSync(configPath, 'utf-8'));
-    const ocProviders = config.providers || {};
+    const modelsSection = config.models || {};
+    const ocProviders = modelsSection.providers || config.providers || {};
 
     for (const [name, p] of Object.entries(ocProviders) as any) {
       if (p.apiKey && !providers.find(x => x.name === name)) {
@@ -96,8 +98,37 @@ function findProvider(model: string): Provider | null {
 
 // 转发请求到上游
 async function proxyRequest(provider: Provider, body: any): Promise<Response> {
-  const url = `${provider.baseUrl}/chat/completions`;
+  if (provider.api === 'anthropic') {
+    // Anthropic Messages API 格式
+    const url = `${provider.baseUrl}/v1/messages`;
+    const messages = body.messages || [];
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': provider.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: body.model,
+        max_tokens: body.max_tokens || 4000,
+        messages,
+      }),
+    });
+    // 转换 Anthropic 响应为 OpenAI 格式
+    const data: any = await resp.json();
+    if (data.content) {
+      return Response.json({
+        choices: [{ message: { role: 'assistant', content: data.content[0]?.text || '' } }],
+        model: data.model,
+        usage: data.usage,
+      });
+    }
+    return Response.json(data, { status: resp.status });
+  }
 
+  // OpenAI 兼容格式
+  const url = `${provider.baseUrl}/chat/completions`;
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
