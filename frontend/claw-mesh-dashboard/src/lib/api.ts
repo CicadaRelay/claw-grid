@@ -170,4 +170,60 @@ export function useEventSocket(
   }, [url, event, enabled]);
 }
 
+// ============ Governance API ============
+const GOV_BASE = '/api/governance';
+
+export interface GovernanceSummary {
+  trust: Array<{
+    agentId: string;
+    score: number;
+    totalTasks: number;
+    successRate: number;
+    avgQuality: number;
+    cooldown: boolean;
+  }>;
+  budget: {
+    hourlyUsage: number;
+    dailyUsage: number;
+    monthlyUsage: number;
+    tier: string;
+    model: string;
+    canAccept: boolean;
+  };
+  audit: Array<{
+    id: string;
+    timestamp: number;
+    eventType: string;
+    agentId?: string;
+    taskId?: string;
+    decision?: string;
+    details: string;
+  }>;
+  policies: Array<{
+    id: string;
+    name: string;
+    level: string;
+    enforcement: string;
+    enabled: boolean;
+  }>;
+  quality: {
+    total: number;
+    approved: number;
+    review: number;
+    rejected: number;
+    avgScore: number;
+  };
+  evolution: {
+    strategy: string;
+    explorationRate: number;
+    diversityIndex: number;
+    recentSuccessRate: number;
+    capsuleCount: number;
+  };
+}
+
+export async function fetchGovernanceSummary(): Promise<GovernanceSummary> {
+  return apiFetch(`${GOV_BASE}/summary`);
+}
+
 export { ENDPOINTS, type NodeId };

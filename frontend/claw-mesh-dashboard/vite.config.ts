@@ -9,6 +9,7 @@ export default defineConfig({
     proxy: {
       '/health': 'http://10.10.0.1:3002',
       '/tools': 'http://10.10.0.1:8080',
+      '/api/governance': 'http://10.10.0.1:3004',
       '/api/mesh': 'http://10.10.0.1:3001',
       '/ws': {
         target: 'ws://10.10.0.1:3001',

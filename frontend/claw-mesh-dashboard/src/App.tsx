@@ -15,11 +15,13 @@ import {
   fetchHealth,
   fetchQueueDepth,
   fetchWorkerLoad,
+  fetchGovernanceSummary,
   usePolling,
   useEventSocket,
   type NodeId,
 } from './lib/api';
 import type { MeshEvent } from './stores/useEventStore';
+import { useGovernanceStore } from './stores/useGovernanceStore';
 
 // ============ 数据轮询 ============
 function DataProvider({ children }: { children: React.ReactNode }) {
@@ -27,6 +29,12 @@ function DataProvider({ children }: { children: React.ReactNode }) {
   const setQueue = useTaskStore((s) => s.setQueue);
   const setWorkerLoad = useTaskStore((s) => s.setWorkerLoad);
   const addEvent = useEventStore((s) => s.addEvent);
+  const setTrust = useGovernanceStore((s) => s.setTrustLeaderboard);
+  const setBudget = useGovernanceStore((s) => s.setBudget);
+  const addAudit = useGovernanceStore((s) => s.addAuditEntries);
+  const setPolicies = useGovernanceStore((s) => s.setPolicies);
+  const setQuality = useGovernanceStore((s) => s.setQuality);
+  const setEvolution = useGovernanceStore((s) => s.setEvolution);
 
   // 各节点健康检查 5s
   const nodeIds: NodeId[] = ['central', 'silicon', 'tokyo'];
@@ -39,6 +47,16 @@ function DataProvider({ children }: { children: React.ReactNode }) {
 
   // Worker 负载 5s
   usePolling(fetchWorkerLoad, setWorkerLoad, 5000);
+
+  // 治理数据 10s
+  usePolling(fetchGovernanceSummary, (data) => {
+    setTrust(data.trust);
+    setBudget(data.budget);
+    addAudit(data.audit);
+    setPolicies(data.policies);
+    setQuality(data.quality);
+    setEvolution(data.evolution.strategy, data.evolution.diversityIndex);
+  }, 10000);
 
   // 实时事件 WebSocket
   useEventSocket('ws://10.10.0.1:3001/ws', 'memov:event', (data) => {
