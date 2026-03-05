@@ -1,0 +1,26 @@
+[package]
+name = "fsc-govern"
+version = "0.1.0"
+edition = "2021"
+description = "FSC-Mesh Governance Sidecar — Rust 治理引擎"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+fred = { version = "9", features = ["i-scripts", "i-sorted-sets", "i-hashes", "i-streams", "i-keys"] }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# HTTP API (替代 Bun governance-api.ts, 省 ~50MB)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+http = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"       # 体积最小化 (中央节点内存敏感)
+lto = true
+strip = true
+codegen-units = 1
