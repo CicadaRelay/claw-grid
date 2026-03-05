@@ -278,7 +278,8 @@ const server = Bun.serve({
             return { id: e.id, ...decoded };
           });
           return json(results);
-        } catch {
+        } catch (err) {
+          console.error('[/api/governance/results] Error:', err);
           return json([]);
         }
       }

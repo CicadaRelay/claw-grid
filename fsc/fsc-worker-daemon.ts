@@ -26,6 +26,14 @@
 import { createClient } from 'redis';
 import { DockerInstance } from './packages/core/src/dockerInstance';
 import { encode as msgpackEncode } from '@msgpack/msgpack';
+import { FscCodec } from '../c/fsc-codec/ffi-bun';
+import { resolve } from 'path';
+
+// C codec for zero-copy heartbeat encoding (fallback to msgpack if unavailable)
+let fscCodec: FscCodec | null = null;
+try {
+  fscCodec = new FscCodec(resolve(import.meta.dir, '../c/fsc-codec/libfsc-ffi.so'));
+} catch { /* C codec not available, using TS fallback */ }
 import winston from 'winston';
 
 // ============ 配置 ============
@@ -629,12 +637,33 @@ async function reportHeartbeat() {
       timestamp: Date.now()
     };
 
-    // 推送心跳到 Redis（含 active_tasks）
-    await redis.xAdd('fsc:heartbeats', '*', {
-      agent: AGENT_ID,
-      active_tasks: (MAX_CONCURRENT - semaphore.available()).toString(),
-      metrics: JSON.stringify(metrics)
-    });
+    // 推送心跳到 Redis — C codec 零拷贝路径 (省 GC 压力)
+    const activeTasks = MAX_CONCURRENT - semaphore.available();
+    const [memUsed, memTotal] = memUsageStr.split('/').map(Number);
+
+    if (fscCodec) {
+      const hbEncoded = fscCodec.encodeHeartbeat({
+        agentId: AGENT_ID,
+        nodeId: REDIS_HOST,
+        cpuPercent: parseFloat(cpuUsageStr) || 0,
+        memUsedMb: memUsed || 0,
+        memTotalMb: memTotal || 0,
+        activeTasks,
+        timestamp: Date.now(),
+      });
+      const b64 = fscCodec.toBase64(Buffer.from(hbEncoded));
+      await redis.xAdd('fsc:heartbeats', '*', {
+        payload: b64,
+        encoding: 'msgpack',
+        type: 'heartbeat',
+      });
+    } else {
+      await redis.xAdd('fsc:heartbeats', '*', {
+        agent: AGENT_ID,
+        active_tasks: activeTasks.toString(),
+        metrics: JSON.stringify(metrics),
+      });
+    }
 
     logger.debug(`[Self-Healing] Heartbeat sent: ${JSON.stringify(metrics)}`);
 
