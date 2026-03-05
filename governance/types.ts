@@ -173,17 +173,18 @@ export interface BudgetState {
   dailyLimit: number;
   monthlyLimit: number;
   currentModel: string;
-  modelTier: 'premium' | 'standard' | 'economy' | 'paused';
+  modelTier: 'premium' | 'standard' | 'economy' | 'free' | 'paused';
   lastResetHourly: number;
   lastResetDaily: number;
 }
 
-export const MODEL_TIERS = {
+export const MODEL_TIERS: Record<string, { models: string[]; costPerToken: number }> = {
   premium:  { models: ['claude-sonnet-4'], costPerToken: 0.003 },
   standard: { models: ['doubao-seed-2.0-code'], costPerToken: 0.0003 },
   economy:  { models: ['minimax-2.5'], costPerToken: 0.0001 },
+  free:     { models: ['openrouter/free'], costPerToken: 0 },
   paused:   { models: [], costPerToken: 0 },
-} as const;
+};
 
 // ============ 进化策略 ============
 export type EvolutionStrategy = 'balanced' | 'innovate' | 'harden' | 'repair-only' | 'auto';

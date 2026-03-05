@@ -12,6 +12,9 @@ export { Arbitration } from './arbitration';
 export { CostController } from './cost-controller';
 export { AuditLog } from './audit-log';
 export { Evolution } from './evolution';
+export { StreamTrimmer } from './stream-trimmer';
+export { GovernanceRustClient } from './rust-client';
+export { decodeStreamMessage, encodeStreamMessage } from './stream-codec';
 
 // 类型导出
 export type {
@@ -59,6 +62,7 @@ import { Arbitration } from './arbitration';
 import { CostController } from './cost-controller';
 import { AuditLog } from './audit-log';
 import { Evolution } from './evolution';
+import { GovernanceRustClient } from './rust-client';
 
 export interface GovernanceLayer {
   policy: PolicyEngine;
@@ -68,9 +72,11 @@ export interface GovernanceLayer {
   cost: CostController;
   audit: AuditLog;
   evolution: Evolution;
+  /** Rust sidecar client (可选, 可用时走高速路径) */
+  rustClient?: GovernanceRustClient;
 }
 
-/** 一键初始化全部治理组件 */
+/** 一键初始化全部治理组件 (自动检测 Rust sidecar) */
 export async function createGovernanceLayer(redis: RedisClientType): Promise<GovernanceLayer> {
   const trust = new TrustFactor(redis);
   const policy = new PolicyEngine(redis);
@@ -87,10 +93,26 @@ export async function createGovernanceLayer(redis: RedisClientType): Promise<Gov
     evolution.init(),
   ]);
 
-  return { policy, trust, quality, arbitration, cost, audit, evolution };
+  // 尝试连接 Rust sidecar (失败则 fallback 到纯 TypeScript)
+  let rustClient: GovernanceRustClient | undefined;
+  try {
+    if (await GovernanceRustClient.isAvailable()) {
+      rustClient = new GovernanceRustClient();
+      await rustClient.connect();
+      console.log('[Governance] Rust sidecar connected — using high-speed path');
+    }
+  } catch {
+    console.log('[Governance] Rust sidecar not available — using TypeScript path');
+  }
+
+  return { policy, trust, quality, arbitration, cost, audit, evolution, rustClient };
 }
 
-/** 关闭治理层（释放订阅） */
+/** 关闭治理层（释放订阅 + Rust client） */
 export async function shutdownGovernanceLayer(layer: GovernanceLayer): Promise<void> {
   await layer.policy.shutdown();
+  layer.audit.shutdown();
+  if (layer.rustClient) {
+    layer.rustClient.disconnect();
+  }
 }

@@ -4,7 +4,8 @@
  * 预算追踪 + 模型自动降级:
  *   < 50%  → premium (claude-sonnet)
  *   50-80% → standard (doubao)
- *   > 80%  → economy (minimax)
+ *   80-95% → economy (minimax)
+ *   95-100% → free (openrouter/nvidia 免费模型)
  *   > 100% → paused (硬停止)
  *
  * Redis: HSET fsc:budget
@@ -26,7 +27,53 @@ const DEFAULT_LIMITS = {
   monthlyLimit: 200.0, // $200/month
 };
 
+/**
+ * Lua 脚本: 原子化 recordCost
+ * 合并 checkReset + 3×hIncrByFloat + getState 为 1 次调用
+ * 返回: [hourlySpent, hourlyLimit, dailySpent, dailyLimit, monthlySpent, monthlyLimit, modelTier, currentModel]
+ */
+const RECORD_COST_LUA = `
+local key = KEYS[1]
+local cost = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local hourMs = tonumber(ARGV[3])
+local dayMs = tonumber(ARGV[4])
+local defaultModel = ARGV[5]
+
+-- checkReset: 检查是否需要重置周期
+local lastHourly = tonumber(redis.call('HGET', key, 'lastResetHourly') or '0') or 0
+local lastDaily = tonumber(redis.call('HGET', key, 'lastResetDaily') or '0') or 0
+
+if now - lastHourly >= hourMs then
+  redis.call('HSET', key, 'hourlySpent', '0', 'lastResetHourly', tostring(now),
+    'modelTier', 'standard', 'currentModel', defaultModel)
+end
+
+if now - lastDaily >= dayMs then
+  redis.call('HSET', key, 'dailySpent', '0', 'lastResetDaily', tostring(now))
+end
+
+-- 累加成本 (3×hIncrByFloat 合并)
+redis.call('HINCRBYFLOAT', key, 'hourlySpent', cost)
+redis.call('HINCRBYFLOAT', key, 'dailySpent', cost)
+redis.call('HINCRBYFLOAT', key, 'monthlySpent', cost)
+
+-- 返回完整状态
+return {
+  redis.call('HGET', key, 'hourlySpent') or '0',
+  redis.call('HGET', key, 'hourlyLimit') or '0.5',
+  redis.call('HGET', key, 'dailySpent') or '0',
+  redis.call('HGET', key, 'dailyLimit') or '10',
+  redis.call('HGET', key, 'monthlySpent') or '0',
+  redis.call('HGET', key, 'monthlyLimit') or '200',
+  redis.call('HGET', key, 'modelTier') or 'standard',
+  redis.call('HGET', key, 'currentModel') or defaultModel
+}
+`;
+
 export class CostController {
+  private luaSha: string | null = null;
+
   constructor(private redis: RedisClientType) {}
 
   /** 初始化预算（首次或重置） */
@@ -46,30 +93,54 @@ export class CostController {
         lastResetDaily: Date.now().toString(),
       });
     }
+
+    // 预加载 Lua 脚本
+    this.luaSha = await this.redis.scriptLoad(RECORD_COST_LUA);
   }
 
-  /** 记录一次任务的成本 */
+  /** 记录一次任务的成本 — 原子化 Lua 脚本 (5 round-trips → 1) */
   async recordCost(taskId: string, agentId: string, costUSD: number, tokensUsed: number): Promise<{
     tier: BudgetState['modelTier'];
     warning: boolean;
     paused: boolean;
   }> {
-    // 先检查是否需要重置周期
-    await this.checkReset();
+    const defaultModel = MODEL_TIERS.standard.models[0];
+    const now = Date.now();
 
-    // 累加
-    await this.redis.hIncrByFloat(BUDGET_KEY, 'hourlySpent', costUSD);
-    await this.redis.hIncrByFloat(BUDGET_KEY, 'dailySpent', costUSD);
-    await this.redis.hIncrByFloat(BUDGET_KEY, 'monthlySpent', costUSD);
+    // 原子化执行: checkReset + 累加 + 读取状态
+    let result: string[];
+    if (this.luaSha) {
+      try {
+        result = await this.redis.evalSha(this.luaSha, {
+          keys: [BUDGET_KEY],
+          arguments: [costUSD.toString(), now.toString(), HOUR_MS.toString(), DAY_MS.toString(), defaultModel],
+        }) as string[];
+      } catch {
+        // SHA 丢失（Redis 重启），重新加载
+        this.luaSha = await this.redis.scriptLoad(RECORD_COST_LUA);
+        result = await this.redis.evalSha(this.luaSha, {
+          keys: [BUDGET_KEY],
+          arguments: [costUSD.toString(), now.toString(), HOUR_MS.toString(), DAY_MS.toString(), defaultModel],
+        }) as string[];
+      }
+    } else {
+      result = await this.redis.eval(RECORD_COST_LUA, {
+        keys: [BUDGET_KEY],
+        arguments: [costUSD.toString(), now.toString(), HOUR_MS.toString(), DAY_MS.toString(), defaultModel],
+      }) as string[];
+    }
 
-    // 获取当前状态
-    const state = await this.getState();
-    const hourlyRatio = state.hourlySpent / state.hourlyLimit;
+    const hourlySpent = parseFloat(result[0] || '0');
+    const hourlyLimit = parseFloat(result[1] || String(DEFAULT_LIMITS.hourlyLimit));
+    const oldTier = (result[6] || 'standard') as BudgetState['modelTier'];
+    const hourlyRatio = hourlySpent / hourlyLimit;
 
     // 决定模型层级
-    let newTier = state.modelTier;
+    let newTier: BudgetState['modelTier'];
     if (hourlyRatio >= 1.0) {
       newTier = 'paused';
+    } else if (hourlyRatio >= 0.95) {
+      newTier = 'free';
     } else if (hourlyRatio >= 0.8) {
       newTier = 'economy';
     } else if (hourlyRatio >= 0.5) {
@@ -79,7 +150,7 @@ export class CostController {
     }
 
     // 层级变化 → 更新 + 发布告警
-    if (newTier !== state.modelTier) {
+    if (newTier !== oldTier) {
       const newModel = newTier === 'paused'
         ? 'none'
         : MODEL_TIERS[newTier].models[0];
@@ -91,11 +162,11 @@ export class CostController {
 
       await this.redis.publish(BUDGET_CHANNEL, JSON.stringify({
         type: 'model_downgrade',
-        from: state.modelTier,
+        from: oldTier,
         to: newTier,
-        hourlySpent: state.hourlySpent,
-        hourlyLimit: state.hourlyLimit,
-        timestamp: Date.now(),
+        hourlySpent,
+        hourlyLimit,
+        timestamp: now,
       }));
     }
 
@@ -138,7 +209,7 @@ export class CostController {
 
   /** 估算一个任务的成本 */
   estimateCost(tokens: number, tier: BudgetState['modelTier']): number {
-    if (tier === 'paused') return 0;
+    if (tier === 'paused' || tier === 'free') return 0;
     return tokens * MODEL_TIERS[tier].costPerToken;
   }
 

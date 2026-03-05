@@ -11,9 +11,29 @@ import type { AuditEntry, AuditEventType } from './types';
 
 const AUDIT_STREAM = 'fsc:governance:audit';
 const MAX_ENTRIES = 10000;
+const TRIM_INTERVAL_MS = 60_000; // 每 60s 修剪一次
 
 export class AuditLog {
-  constructor(private redis: RedisClientType) {}
+  private trimTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(private redis: RedisClientType) {
+    // 解耦 xTrim: 定时修剪，而非每次写入都修剪 (省 2-5ms/event)
+    this.trimTimer = setInterval(async () => {
+      try {
+        await this.redis.xTrim(AUDIT_STREAM, 'MAXLEN', MAX_ENTRIES);
+      } catch { /* Redis 断开时静默 */ }
+    }, TRIM_INTERVAL_MS);
+    // 允许定时器不阻止进程退出
+    if (this.trimTimer.unref) this.trimTimer.unref();
+  }
+
+  /** 停止定时修剪（优雅关闭） */
+  shutdown(): void {
+    if (this.trimTimer) {
+      clearInterval(this.trimTimer);
+      this.trimTimer = null;
+    }
+  }
 
   /** 记录审计事件 */
   async record(entry: AuditEntry): Promise<string> {
@@ -29,12 +49,7 @@ export class AuditLog {
     if (entry.trustBefore !== undefined) fields.trustBefore = entry.trustBefore.toString();
     if (entry.trustAfter !== undefined) fields.trustAfter = entry.trustAfter.toString();
 
-    const id = await this.redis.xAdd(AUDIT_STREAM, '*', fields);
-
-    // 修剪保留最近 10000 条
-    await this.redis.xTrim(AUDIT_STREAM, 'MAXLEN', MAX_ENTRIES);
-
-    return id;
+    return await this.redis.xAdd(AUDIT_STREAM, '*', fields);
   }
 
   /** 快捷方法 */

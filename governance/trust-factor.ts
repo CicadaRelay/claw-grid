@@ -156,13 +156,16 @@ export class TrustFactor {
       profile.avgQualityScore = totalQuality / profile.totalTasks;
     }
 
-    await this.saveProfile(profile);
-
-    // 更新排行榜
-    await this.redis.zAdd(TRUST_LEADERBOARD, {
-      score: profile.score,
-      value: receipt.agentId,
-    });
+    // saveProfile + zAdd 合并为 1 次 multi (2 round-trips → 1)
+    const key = TRUST_KEY_PREFIX + profile.agentId;
+    const data: Record<string, string> = {};
+    for (const [k, v] of Object.entries(profile)) {
+      data[k] = String(v);
+    }
+    await this.redis.multi()
+      .hSet(key, data)
+      .zAdd(TRUST_LEADERBOARD, { score: profile.score, value: receipt.agentId })
+      .exec();
 
     return updates;
   }
@@ -175,8 +178,16 @@ export class TrustFactor {
     } else {
       profile.score = Math.max(MIN_SCORE, profile.score - update.amount);
     }
-    await this.saveProfile(profile);
-    await this.redis.zAdd(TRUST_LEADERBOARD, { score: profile.score, value: agentId });
+    // saveProfile + zAdd 合并为 multi
+    const key = TRUST_KEY_PREFIX + profile.agentId;
+    const data: Record<string, string> = {};
+    for (const [k, v] of Object.entries(profile)) {
+      data[k] = String(v);
+    }
+    await this.redis.multi()
+      .hSet(key, data)
+      .zAdd(TRUST_LEADERBOARD, { score: profile.score, value: agentId })
+      .exec();
   }
 
   /** 强制冷却（降权） */
@@ -201,13 +212,22 @@ export class TrustFactor {
       MAX_SCORE,
     );
 
+    if (candidates.length === 0) return [];
+
+    // Pipeline 批量查询 cooldownUntil (O(N) round-trips → 1)
+    const reversed = candidates.reverse();
+    const pipeline = this.redis.multi();
+    for (const c of reversed) {
+      pipeline.hGet(TRUST_KEY_PREFIX + c.value, 'cooldownUntil');
+    }
+    const cooldowns = await pipeline.exec() as unknown as (string | null)[];
+
     const now = Date.now();
     const eligible: string[] = [];
-    for (const c of candidates.reverse()) {
-      if (eligible.length >= limit) break;
-      const cooldown = await this.redis.hGet(TRUST_KEY_PREFIX + c.value, 'cooldownUntil');
-      if (!cooldown || parseInt(cooldown) <= now) {
-        eligible.push(c.value);
+    for (let i = 0; i < reversed.length && eligible.length < limit; i++) {
+      const cd = cooldowns[i];
+      if (!cd || parseInt(cd) <= now) {
+        eligible.push(reversed[i].value);
       }
     }
 
@@ -228,10 +248,16 @@ export class TrustFactor {
     const avgScore = all.reduce((sum, r) => sum + r.score, 0) / all.length;
     const topAgent = all.length > 0 ? all[all.length - 1].value : null;
 
+    // Pipeline 批量查询 cooldownUntil (O(N) round-trips → 1)
+    const pipeline = this.redis.multi();
+    for (const a of all) {
+      pipeline.hGet(TRUST_KEY_PREFIX + a.value, 'cooldownUntil');
+    }
+    const cooldowns = await pipeline.exec() as unknown as (string | null)[];
+
     const now = Date.now();
     let inCooldown = 0;
-    for (const a of all) {
-      const cd = await this.redis.hGet(TRUST_KEY_PREFIX + a.value, 'cooldownUntil');
+    for (const cd of cooldowns) {
       if (cd && parseInt(cd) > now) inCooldown++;
     }
 
