@@ -1,318 +1,305 @@
 #!/usr/bin/env bun
 /**
- * MemoV MCP Proxy Server
- * 
- * 功能：
- * - 转发前端请求到 MemoV MCP 服务器
- * - WebSocket 实时推送 MemoV 事件
- * - 提供 RESTful API 接口
+ * MemoV MCP Proxy Server — Bun.serve 版
+ *
+ * - RESTful API: mesh 拓扑, memov 时间线, 搜索, 因果调试, 回滚
+ * - WebSocket 实时推送 (原生 Bun WebSocket, 替代 socket.io)
  */
 
-import { createServer } from 'http';
-import { Server as SocketIOServer } from 'socket.io';
-import express from 'express';
-import cors from 'cors';
-import { createClient } from 'redis';
+import { createClient, type RedisClientType } from 'redis';
 import { execSync } from 'child_process';
+import { REDIS_URL } from '../config/redis';
 
 // Memory modules
 const causal = require('../memory/causal');
 const { PointerSystem } = require('../memory/pointer');
 const { QdrantPointerStore } = require('../memory/qdrant-pointer');
 
-const app = express();
-const server = createServer(app);
-const io = new SocketIOServer(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
-});
-
-// ============ 配置 ============
-const PORT = parseInt(process.env.PORT || '3001');
-const REDIS_HOST = process.env.REDIS_HOST || '10.10.0.1';
-const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
+const PORT = parseInt(process.env.MEMOV_PORT || process.env.PORT || '3001');
 const MEMOV_PATH = process.env.MEMOV_PATH || '/opt/claw-mesh/.mem';
 
-// ============ Memory 模块 ============
-const pointerSystem = new PointerSystem();
-let qdrantStore: any = null;
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
 
-// ============ Redis 客户端 ============
-const redis = createClient({
-  socket: {
-    host: REDIS_HOST,
-    port: REDIS_PORT
-  }
-});
-
-redis.on('error', (err) => console.error('Redis error:', err));
-redis.on('connect', () => console.log('Redis connected'));
-
-// ============ 中间件 ============
-app.use(cors());
-app.use(express.json());
-
-// ============ API 路由 ============
-
-// 获取 Mesh 拓扑
-app.get('/api/mesh/topology', async (req, res) => {
-  try {
-    // 从 Redis 获取所有 Worker 心跳
-    const heartbeats = await redis.xRead(
-      [{ key: 'fsc:heartbeats', id: '0' }],
-      { COUNT: 100 }
-    );
-    
-    const nodes = [];
-    if (heartbeats) {
-      for (const { messages } of heartbeats) {
-        for (const { message } of messages) {
-          const metrics = JSON.parse(message.metrics);
-          nodes.push({
-            id: message.agent,
-            ...metrics
-          });
-        }
-      }
-    }
-    
-    res.json({ nodes });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 获取 MemoV 时间线
-app.get('/api/memov/timeline', async (req, res) => {
-  try {
-    const { since = '0', limit = 50 } = req.query;
-    
-    const events = await redis.xRead(
-      [{ key: 'fsc:mem_events', id: since as string }],
-      { COUNT: parseInt(limit as string) }
-    );
-    
-    const timeline = [];
-    if (events) {
-      for (const { messages } of events) {
-        for (const { id, message } of messages) {
-          timeline.push({
-            id,
-            ...message,
-            timestamp: parseInt(message.timestamp)
-          });
-        }
-      }
-    }
-    
-    res.json({ timeline });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 全局搜索 (关键词 + Qdrant 降级策略)
-app.post('/api/search', async (req, res) => {
-  try {
-    const { query, limit = 10 } = req.body;
-
-    // 1. 关键词搜索 (PointerSystem, 内存)
-    const keywords = query.split(/\s+/).filter(Boolean);
-    const keywordResults = pointerSystem.searchByKeywords(keywords);
-
-    // 2. Qdrant filter 搜索 (如果可用，按 active 状态过滤)
-    let qdrantResults: any[] = [];
-    if (qdrantStore) {
-      try {
-        qdrantResults = await qdrantStore.filterPointers(
-          { must: [{ key: 'status', match: { value: 'active' } }] },
-          limit
-        );
-      } catch { /* Qdrant 不可用，静默降级 */ }
-    }
-
-    // 3. 合并 + 去重
-    const seen = new Set<string>();
-    const results: any[] = [];
-
-    for (const item of keywordResults) {
-      const ptr = item.pointer;
-      if (!seen.has(ptr)) {
-        seen.add(ptr);
-        results.push({
-          pointer: ptr,
-          score: 1.0,
-          content: item.content || item.topic || '',
-          timestamp: item.updated_at || item.created_at || Date.now()
-        });
-      }
-    }
-
-    for (const item of qdrantResults) {
-      const ptr = item.pointer;
-      if (ptr && !seen.has(ptr)) {
-        seen.add(ptr);
-        results.push({
-          pointer: ptr,
-          score: 0.8,
-          content: item.content || item.topic || '',
-          timestamp: item.updated_at || item.created_at || Date.now()
-        });
-      }
-    }
-
-    res.json({ results: results.slice(0, limit) });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 因果调试 (diagnose / trace / learn)
-app.post('/api/causal/debug', async (req, res) => {
-  try {
-    const { pointer, mode, errorLog } = req.body;
-
-    if (mode === 'trace') {
-      const chain = causal.getCausalChain(pointer);
-      return res.json({ pointer, mode, chain, issues: [], suggestions: [] });
-    }
-
-    if (mode === 'learn') {
-      const entity = causal.learnFromSuccess(pointer, errorLog || '');
-      return res.json({ pointer, mode, entity, issues: [], suggestions: [] });
-    }
-
-    // 默认 diagnose
-    const finding = causal.diagnoseFailure(pointer, errorLog || mode || '');
-    res.json({
-      pointer,
-      mode: 'diagnose',
-      finding,
-      issues: finding.cause ? [{ cause: finding.cause, confidence: finding.confidence }] : [],
-      suggestions: finding.fix ? [finding.fix] : []
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 时光回滚 (Git snapshot checkout)
-app.post('/api/memov/rollback', async (req, res) => {
-  try {
-    const { timestamp, target } = req.body;
-
-    // 校验 target 防止命令注入
-    if (target && target !== 'all' && !/^[a-zA-Z0-9_-]+$/.test(target)) {
-      return res.status(400).json({ success: false, message: 'Invalid target format' });
-    }
-
-    const isoTime = new Date(timestamp).toISOString();
-
-    // 1. 找到指定时间之前最近的 commit
-    const commitHash = execSync(
-      `git -C "${MEMOV_PATH}" log --before="${isoTime}" --format="%H" -1`,
-      { encoding: 'utf-8' }
-    ).trim();
-
-    if (!commitHash) {
-      return res.status(404).json({ success: false, message: 'No commit found before timestamp' });
-    }
-
-    // 2. 执行回滚
-    if (!target || target === 'all') {
-      execSync(`git -C "${MEMOV_PATH}" checkout ${commitHash} -- .`);
-    } else {
-      execSync(`git -C "${MEMOV_PATH}" checkout ${commitHash} -- agents/${target}/`);
-    }
-
-    // 3. 发布回滚事件到 Redis Streams
-    await redis.xAdd('fsc:mem_events', '*', {
-      type: 'rollback',
-      timestamp: String(Date.now()),
-      rollback_to: String(timestamp),
-      target: target || 'all',
-      commit_hash: commitHash,
-    });
-
-    res.json({ success: true, message: `Rolled back to ${isoTime}`, commitHash, target: target || 'all' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 健康检查
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: Date.now(),
-    redis: redis.isOpen ? 'connected' : 'disconnected'
-  });
-});
-
-// ============ WebSocket 实时推送 ============
-io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-  
-  // 订阅 Redis Streams
-  const subscriber = redis.duplicate();
-  
-  subscriber.connect().then(async () => {
-    // 监听 MemoV 事件
-    while (true) {
-      try {
-        const events = await subscriber.xRead(
-          [{ key: 'fsc:mem_events', id: '$' }],
-          { BLOCK: 1000 }
-        );
-        
-        if (events) {
-          for (const { messages } of events) {
-            for (const { id, message } of messages) {
-              socket.emit('memov:event', {
-                id,
-                ...message,
-                timestamp: parseInt(message.timestamp)
-              });
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Stream read error:', error);
-        break;
-      }
-    }
-  });
-  
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    subscriber.quit();
-  });
-});
-
-// ============ 启动服务器 ============
-async function start() {
-  await redis.connect();
-
-  // 初始化 Qdrant (失败不阻塞启动)
-  try {
-    qdrantStore = new QdrantPointerStore(process.env.QDRANT_URL || 'http://localhost:6333');
-    await qdrantStore.initialize();
-    console.log('Qdrant connected');
-  } catch {
-    qdrantStore = null;
-    console.log('Qdrant unavailable, using keyword search only');
-  }
-
-  server.listen(PORT, () => {
-    console.log(`MemoV MCP Proxy listening on port ${PORT}`);
-    console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
+function json(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
   });
 }
 
-start().catch((error) => {
-  console.error('Failed to start server:', error);
-  process.exit(1);
+// ============ State ============
+let redis: RedisClientType;
+const pointerSystem = new PointerSystem();
+let qdrantStore: any = null;
+
+// WebSocket 订阅者集合
+const wsClients = new Set<any>();
+let streamPolling = false;
+
+// ============ Redis Stream → WebSocket 推送 ============
+async function startStreamPolling() {
+  if (streamPolling) return;
+  streamPolling = true;
+
+  let lastId = '$';
+  while (streamPolling) {
+    try {
+      if (wsClients.size === 0) {
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+
+      const events = await redis.xRead(
+        [{ key: 'fsc:mem_events', id: lastId }],
+        { BLOCK: 2000, COUNT: 50 },
+      );
+
+      if (events) {
+        for (const { messages } of events) {
+          for (const { id, message } of messages) {
+            lastId = id;
+            const payload = JSON.stringify({
+              type: 'memov:event',
+              id,
+              ...message,
+              timestamp: parseInt(message.timestamp || '0'),
+            });
+            for (const ws of wsClients) {
+              try { ws.send(payload); } catch { wsClients.delete(ws); }
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error('[Stream] Poll error:', err.message);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+}
+
+// ============ Route handlers ============
+
+async function handleTopology() {
+  const heartbeats = await redis.xRead(
+    [{ key: 'fsc:heartbeats', id: '0' }],
+    { COUNT: 100 },
+  );
+
+  const nodes: any[] = [];
+  if (heartbeats) {
+    for (const { messages } of heartbeats) {
+      for (const { message } of messages) {
+        try {
+          const metrics = JSON.parse(message.metrics || '{}');
+          nodes.push({ id: message.agent, ...metrics });
+        } catch { /* skip malformed */ }
+      }
+    }
+  }
+  return json({ nodes });
+}
+
+async function handleTimeline(url: URL) {
+  const since = url.searchParams.get('since') || '0';
+  const limit = parseInt(url.searchParams.get('limit') || '50');
+
+  const events = await redis.xRead(
+    [{ key: 'fsc:mem_events', id: since }],
+    { COUNT: limit },
+  );
+
+  const timeline: any[] = [];
+  if (events) {
+    for (const { messages } of events) {
+      for (const { id, message } of messages) {
+        timeline.push({ id, ...message, timestamp: parseInt(message.timestamp || '0') });
+      }
+    }
+  }
+  return json({ timeline });
+}
+
+async function handleSearch(body: any) {
+  const { query, limit = 10 } = body;
+
+  const keywords = query.split(/\s+/).filter(Boolean);
+  const keywordResults = pointerSystem.searchByKeywords(keywords);
+
+  let qdrantResults: any[] = [];
+  if (qdrantStore) {
+    try {
+      qdrantResults = await qdrantStore.filterPointers(
+        { must: [{ key: 'status', match: { value: 'active' } }] },
+        limit,
+      );
+    } catch { /* Qdrant unavailable */ }
+  }
+
+  const seen = new Set<string>();
+  const results: any[] = [];
+
+  for (const item of keywordResults) {
+    const ptr = item.pointer;
+    if (!seen.has(ptr)) {
+      seen.add(ptr);
+      results.push({
+        pointer: ptr, score: 1.0,
+        content: item.content || item.topic || '',
+        timestamp: item.updated_at || item.created_at || Date.now(),
+      });
+    }
+  }
+
+  for (const item of qdrantResults) {
+    const ptr = item.pointer;
+    if (ptr && !seen.has(ptr)) {
+      seen.add(ptr);
+      results.push({
+        pointer: ptr, score: 0.8,
+        content: item.content || item.topic || '',
+        timestamp: item.updated_at || item.created_at || Date.now(),
+      });
+    }
+  }
+
+  return json({ results: results.slice(0, limit) });
+}
+
+async function handleCausalDebug(body: any) {
+  const { pointer, mode, errorLog } = body;
+
+  if (mode === 'trace') {
+    const chain = causal.getCausalChain(pointer);
+    return json({ pointer, mode, chain, issues: [], suggestions: [] });
+  }
+
+  if (mode === 'learn') {
+    const entity = causal.learnFromSuccess(pointer, errorLog || '');
+    return json({ pointer, mode, entity, issues: [], suggestions: [] });
+  }
+
+  const finding = causal.diagnoseFailure(pointer, errorLog || mode || '');
+  return json({
+    pointer, mode: 'diagnose', finding,
+    issues: finding.cause ? [{ cause: finding.cause, confidence: finding.confidence }] : [],
+    suggestions: finding.fix ? [finding.fix] : [],
+  });
+}
+
+async function handleRollback(body: any) {
+  const { timestamp, target } = body;
+
+  if (target && target !== 'all' && !/^[a-zA-Z0-9_-]+$/.test(target)) {
+    return json({ success: false, message: 'Invalid target format' }, 400);
+  }
+
+  const isoTime = new Date(timestamp).toISOString();
+
+  const commitHash = execSync(
+    `git -C "${MEMOV_PATH}" log --before="${isoTime}" --format="%H" -1`,
+    { encoding: 'utf-8' },
+  ).trim();
+
+  if (!commitHash) {
+    return json({ success: false, message: 'No commit found before timestamp' }, 404);
+  }
+
+  if (!target || target === 'all') {
+    execSync(`git -C "${MEMOV_PATH}" checkout ${commitHash} -- .`);
+  } else {
+    execSync(`git -C "${MEMOV_PATH}" checkout ${commitHash} -- agents/${target}/`);
+  }
+
+  await redis.xAdd('fsc:mem_events', '*', {
+    type: 'rollback',
+    timestamp: String(Date.now()),
+    rollback_to: String(timestamp),
+    target: target || 'all',
+    commit_hash: commitHash,
+  });
+
+  return json({ success: true, message: `Rolled back to ${isoTime}`, commitHash, target: target || 'all' });
+}
+
+// ============ Bun.serve ============
+
+async function init() {
+  redis = createClient({ url: REDIS_URL }) as RedisClientType;
+  redis.on('error', (err) => console.error('[Redis]', err.message));
+  await redis.connect();
+  console.log('[Redis] Connected');
+
+  try {
+    qdrantStore = new QdrantPointerStore(process.env.QDRANT_URL || 'http://localhost:6333');
+    await qdrantStore.initialize();
+    console.log('[Qdrant] Connected');
+  } catch {
+    qdrantStore = null;
+    console.log('[Qdrant] Unavailable, keyword search only');
+  }
+
+  startStreamPolling();
+}
+
+await init();
+
+const server = Bun.serve({
+  port: PORT,
+  async fetch(req, server) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    if (req.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // WebSocket upgrade
+    if (path === '/ws' && req.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+      const success = server.upgrade(req);
+      if (success) return undefined as any;
+      return json({ error: 'WebSocket upgrade failed' }, 400);
+    }
+
+    try {
+      if (path === '/health') {
+        return json({ status: 'ok', timestamp: Date.now(), redis: redis.isOpen ? 'connected' : 'disconnected', wsClients: wsClients.size });
+      }
+
+      if (path === '/api/mesh/topology' && req.method === 'GET') return await handleTopology();
+      if (path === '/api/memov/timeline' && req.method === 'GET') return await handleTimeline(url);
+
+      if (req.method === 'POST') {
+        const body = await req.json();
+        if (path === '/api/search') return await handleSearch(body);
+        if (path === '/api/causal/debug') return await handleCausalDebug(body);
+        if (path === '/api/memov/rollback') return await handleRollback(body);
+      }
+
+      return json({ error: 'Not found' }, 404);
+    } catch (err: any) {
+      console.error(`[${path}] Error:`, err.message);
+      return json({ error: err.message }, 500);
+    }
+  },
+
+  websocket: {
+    open(ws) {
+      wsClients.add(ws);
+      console.log(`[WS] Client connected (${wsClients.size} total)`);
+    },
+    close(ws) {
+      wsClients.delete(ws);
+      console.log(`[WS] Client disconnected (${wsClients.size} total)`);
+    },
+    message(_ws, _message) {
+      // Client messages not needed for now
+    },
+  },
 });
+
+console.log(`[MemoV MCP Proxy] Listening on http://0.0.0.0:${server.port}`);
+console.log(`[MemoV MCP Proxy] WebSocket: ws://0.0.0.0:${server.port}/ws`);
