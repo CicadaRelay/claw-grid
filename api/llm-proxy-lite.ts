@@ -15,6 +15,7 @@
  */
 
 import { createClient, type RedisClientType } from 'redis';
+import { FreeProviderPool } from './free-provider-pool';
 
 const PORT = parseInt(process.env.LLM_PROXY_PORT || '3002');
 
@@ -24,6 +25,7 @@ const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
 const REDIS_PASSWORD = process.env.REDIS_PASSWORD || 'fsc-mesh-2026';
 
 let redis: RedisClientType | null = null;
+let freePool: FreeProviderPool | null = null;
 
 async function getRedis(): Promise<RedisClientType> {
   if (redis && redis.isOpen) return redis;
@@ -33,6 +35,11 @@ async function getRedis(): Promise<RedisClientType> {
   redis.on('error', (err) => console.error('[Redis] Error:', err.message));
   await redis.connect();
   console.log('[Redis] Connected');
+
+  // 初始化 FreeProviderPool
+  freePool = new FreeProviderPool(redis as any);
+  await freePool.init();
+
   return redis;
 }
 
@@ -46,6 +53,7 @@ interface Provider {
   apiKey: string;
   models: string[];
   api: 'openai' | 'anthropic';
+  _freeId?: string;  // 标记来自 FreeProviderPool 的 endpoint ID
 }
 
 function loadProvidersSync(): Provider[] {
@@ -119,6 +127,23 @@ let totalReports = 0;
 // ============ Provider 路由 ============
 function findProvider(model: string): Provider | null {
   const ml = model.toLowerCase();
+
+  // 免费模型: ":free" 后缀 或 "openrouter/free" 标识
+  if (freePool && (ml.includes(':free') || ml === 'openrouter/free')) {
+    const ep = freePool.getNextEndpoint();
+    if (ep) {
+      return {
+        name: `free:${ep.provider}`,
+        baseUrl: ep.baseUrl,
+        apiKey: ep.apiKey,
+        models: [ep.model],
+        api: 'openai',
+        _freeId: ep.id,
+      };
+    }
+    // 无可用 free endpoint，降级到普通 provider
+  }
+
   // 精确匹配 (大小写不敏感)
   for (const p of providers) {
     if (p.models.some(m => m.toLowerCase() === ml)) return p;
@@ -251,7 +276,7 @@ const server = Bun.serve({
       try {
         const body = await req.json();
         const model = body.model || 'doubao-lite-32k';
-        const provider = findProvider(model);
+        let provider = findProvider(model);
 
         if (!provider) {
           totalErrors++;
@@ -260,8 +285,37 @@ const server = Bun.serve({
 
         body.max_tokens = Math.min(body.max_tokens || 4000, 4000);
 
-        const resp = await proxyRequest(provider, body);
-        const data = await resp.json();
+        // Free endpoint: 用实际模型名替换请求中的模型
+        if (provider._freeId) {
+          body.model = provider.models[0];
+        }
+
+        let resp = await proxyRequest(provider, body);
+        let data: any = await resp.json();
+
+        // Free endpoint 失败 → 报告 + 重试一次
+        if (!resp.ok && provider._freeId && freePool) {
+          freePool.reportFailure(provider._freeId);
+          console.log(`[LLM Proxy] Free endpoint failed (${provider._freeId}), retrying...`);
+
+          const retryProvider = findProvider(model);
+          if (retryProvider && retryProvider._freeId !== provider._freeId) {
+            if (retryProvider._freeId) {
+              body.model = retryProvider.models[0];
+            }
+            resp = await proxyRequest(retryProvider, body);
+            data = await resp.json();
+            provider = retryProvider;
+
+            if (!resp.ok && retryProvider._freeId) {
+              freePool.reportFailure(retryProvider._freeId);
+            } else if (resp.ok && retryProvider._freeId) {
+              freePool.reportSuccess(retryProvider._freeId);
+            }
+          }
+        } else if (resp.ok && provider._freeId && freePool) {
+          freePool.reportSuccess(provider._freeId);
+        }
 
         if (!resp.ok) {
           totalErrors++;
@@ -273,6 +327,53 @@ const server = Bun.serve({
         totalErrors++;
         console.error(`[LLM Proxy] Error: ${err.message}`);
         return Response.json({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // --- Free Provider CRUD ---
+    if (url.pathname === '/free-providers') {
+      if (req.method === 'GET') {
+        if (!freePool) return Response.json({ endpoints: [], summary: { total: 0, healthy: 0, open: 0, halfOpen: 0 } });
+        return Response.json({ endpoints: freePool.getStatus(), summary: freePool.getSummary() });
+      }
+
+      if (req.method === 'POST') {
+        if (!freePool) return Response.json({ error: 'Free pool not initialized' }, { status: 503 });
+        try {
+          const body = await req.json();
+          const ep = await freePool.addEndpoint({
+            provider: body.provider || 'custom',
+            baseUrl: body.baseUrl,
+            apiKey: body.apiKey || '',
+            model: body.model,
+            enabled: body.enabled !== false,
+          });
+          return Response.json({ ok: true, endpoint: ep });
+        } catch (err: any) {
+          return Response.json({ error: err.message }, { status: 400 });
+        }
+      }
+    }
+
+    // DELETE/PATCH /free-providers/:id
+    if (url.pathname.startsWith('/free-providers/')) {
+      const id = decodeURIComponent(url.pathname.slice('/free-providers/'.length));
+
+      if (req.method === 'DELETE') {
+        if (!freePool) return Response.json({ error: 'Free pool not initialized' }, { status: 503 });
+        const ok = await freePool.removeEndpoint(id);
+        return Response.json({ ok });
+      }
+
+      if (req.method === 'PATCH') {
+        if (!freePool) return Response.json({ error: 'Free pool not initialized' }, { status: 503 });
+        try {
+          const body = await req.json();
+          const ok = await freePool.setEnabled(id, body.enabled);
+          return Response.json({ ok });
+        } catch (err: any) {
+          return Response.json({ error: err.message }, { status: 400 });
+        }
       }
     }
 

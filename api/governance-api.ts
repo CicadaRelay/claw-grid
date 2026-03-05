@@ -15,6 +15,8 @@
  */
 
 import { createClient } from 'redis';
+import { StreamTrimmer } from '../governance/stream-trimmer';
+import { decodeStreamMessage } from '../governance/stream-codec';
 
 const PORT = parseInt(process.env.GOVERNANCE_PORT || '3004');
 const REDIS_HOST = process.env.REDIS_HOST || '10.10.0.1';
@@ -30,6 +32,11 @@ const redis = createClient({
 redis.on('error', (err) => console.error('[Redis]', err.message));
 await redis.connect();
 console.log(`[Governance API] Redis connected: ${REDIS_HOST}:${REDIS_PORT}`);
+
+// ============ Stream Trimmer (每5分钟修剪, 回收 20-30MB) ============
+const trimmer = new StreamTrimmer(redis as any);
+trimmer.start();
+console.log('[Governance API] Stream trimmer started (5min interval)');
 
 // ============ 数据获取函数 ============
 
@@ -177,24 +184,33 @@ async function getEvolution() {
   };
 }
 
+async function fetchFreeProviders() {
+  try {
+    const resp = await fetch('http://127.0.0.1:3002/free-providers', { signal: AbortSignal.timeout(3000) });
+    if (resp.ok) return await resp.json();
+  } catch { /* llm-proxy may not be running */ }
+  return { endpoints: [], summary: { total: 0, healthy: 0, open: 0, halfOpen: 0 } };
+}
+
 async function getFullSummary() {
-  const [trust, budget, audit, policies, quality, evolution] = await Promise.all([
+  const [trust, budget, audit, policies, quality, evolution, freeProviders] = await Promise.all([
     getTrustLeaderboard(),
     getBudget(),
     getAuditLog(100),
     getPolicies(),
     getQualitySummary(),
     getEvolution(),
+    fetchFreeProviders(),
   ]);
 
-  return { trust, budget, audit, policies, quality, evolution };
+  return { trust, budget, audit, policies, quality, evolution, freeProviders };
 }
 
 // ============ HTTP Server ============
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
 
@@ -251,6 +267,38 @@ const server = Bun.serve({
 
       if (path === '/api/governance/evolution') {
         return json(await getEvolution());
+      }
+
+      if (path === '/api/governance/results') {
+        const count = parseInt(url.searchParams.get('count') || '20');
+        try {
+          const entries = await redis.xRevRange('fsc:results', '+', '-', { COUNT: count });
+          const results = entries.map((e) => {
+            const decoded = decodeStreamMessage(e.message);
+            return { id: e.id, ...decoded };
+          });
+          return json(results);
+        } catch {
+          return json([]);
+        }
+      }
+
+      // ============ Free Provider 代理到 llm-proxy-lite (port 3002) ============
+      if (path === '/api/governance/free-providers' || path.startsWith('/api/governance/free-providers/')) {
+        const proxyPath = path.replace('/api/governance', '');
+        const proxyUrl = `http://127.0.0.1:3002${proxyPath}`;
+        try {
+          const proxyResp = await fetch(proxyUrl, {
+            method: req.method,
+            headers: { 'Content-Type': 'application/json' },
+            body: (req.method === 'POST' || req.method === 'PATCH') ? await req.text() : undefined,
+            signal: AbortSignal.timeout(5000),
+          });
+          const data = await proxyResp.json();
+          return json(data, proxyResp.status);
+        } catch (err) {
+          return json({ error: 'LLM Proxy unavailable', detail: String(err) }, 502);
+        }
       }
 
       return json({ error: 'Not found' }, 404);
