@@ -186,6 +186,29 @@ export const MODEL_TIERS: Record<string, { models: string[]; costPerToken: numbe
   paused:   { models: [], costPerToken: 0 },
 };
 
+// ============ 跨模型验证 ============
+export interface CrossModelVerification {
+  taskId: string;
+  /** 每个模型独立产出的结果 */
+  results: CrossModelResult[];
+  /** 关键词重叠度 (Jaccard 系数, 0-1) */
+  keywordOverlap: number;
+  /** 是否达成共识 (overlap >= threshold) */
+  consensus: boolean;
+  /** 共识阈值 */
+  threshold: number;
+  timestamp: number;
+}
+
+export interface CrossModelResult {
+  modelTier: string;          // 'claude' | 'codex' | 'gemini'
+  agentId: string;
+  gitDiff?: string;
+  qualityScore: number;
+  status: 'success' | 'failure' | 'timeout';
+  durationMs: number;
+}
+
 // ============ 进化策略 ============
 export type EvolutionStrategy = 'balanced' | 'innovate' | 'harden' | 'repair-only' | 'auto';
 

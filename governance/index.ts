@@ -42,6 +42,9 @@ export type {
   VoteDecision,
   // 成本
   BudgetState,
+  // 跨模型验证
+  CrossModelVerification,
+  CrossModelResult,
   // 进化
   EvolutionStrategy,
   EvolutionState,

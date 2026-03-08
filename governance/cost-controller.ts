@@ -244,6 +244,69 @@ export class CostController {
     };
   }
 
+  /**
+   * 任务级模型选择 — 根据任务风险+token量选最优 tier
+   *
+   * 策略:
+   * - critical/high → 尽量 premium，预算不够则 standard
+   * - medium → standard 优先
+   * - low → 当前全局 tier
+   * - 跨模型验证任务 → 强制 economy（省钱，多模型量取胜）
+   */
+  async getModelForTask(task: {
+    riskLevel: string;
+    estimatedTokens: number;
+    crossModelVerify?: boolean;
+  }): Promise<{ model: string; tier: BudgetState['modelTier']; estimatedCost: number }> {
+    const state = await this.getState();
+
+    if (state.modelTier === 'paused') {
+      return { model: 'none', tier: 'paused', estimatedCost: 0 };
+    }
+
+    // 跨模型验证 → 用廉价模型（要跑多次）
+    if (task.crossModelVerify) {
+      const tier = 'economy' as const;
+      return {
+        model: MODEL_TIERS[tier].models[0],
+        tier,
+        estimatedCost: this.estimateCost(task.estimatedTokens, tier),
+      };
+    }
+
+    // 高风险 → 尝试 premium
+    if (task.riskLevel === 'critical' || task.riskLevel === 'high') {
+      const premiumCost = this.estimateCost(task.estimatedTokens, 'premium');
+      const headroom = state.hourlyLimit - state.hourlySpent;
+
+      if (premiumCost <= headroom * 0.5) {
+        // 还有足够预算（不超过剩余的 50%）→ premium
+        return { model: MODEL_TIERS.premium.models[0], tier: 'premium', estimatedCost: premiumCost };
+      }
+      // 预算紧张 → standard
+      const standardCost = this.estimateCost(task.estimatedTokens, 'standard');
+      return { model: MODEL_TIERS.standard.models[0], tier: 'standard', estimatedCost: standardCost };
+    }
+
+    // medium → standard
+    if (task.riskLevel === 'medium') {
+      let tier: BudgetState['modelTier'] = state.modelTier === 'premium' ? 'standard' : state.modelTier;
+      if (tier === 'paused') tier = 'economy';
+      return {
+        model: MODEL_TIERS[tier].models[0],
+        tier,
+        estimatedCost: this.estimateCost(task.estimatedTokens, tier),
+      };
+    }
+
+    // low → 跟全局 tier
+    return {
+      model: state.currentModel,
+      tier: state.modelTier,
+      estimatedCost: this.estimateCost(task.estimatedTokens, state.modelTier),
+    };
+  }
+
   // ============ 内部方法 ============
 
   /** 检查并执行周期重置 */

@@ -12,7 +12,7 @@
  */
 
 import type { RedisClientType } from 'redis';
-import type { QualityReport, QualityDetail, RiskLevel } from './types';
+import type { QualityReport, QualityDetail, RiskLevel, CrossModelVerification, CrossModelResult } from './types';
 
 const REVIEW_QUEUE = 'fsc:review_queue';
 
@@ -27,6 +27,8 @@ interface JudgeInput {
   touchedFiles: string[];
   allowedFiles?: string[];
   commitMessage?: string;
+  /** 跨模型验证结果（高风险任务由多个模型独立产出） */
+  crossModelResults?: CrossModelResult[];
 }
 
 export class QualityJudge {
@@ -206,11 +208,12 @@ export class QualityJudge {
 
   // ============ Layer 3: LLM Judge (0-30) ============
   private async evaluateLayer3(input: JudgeInput, details: QualityDetail[]): Promise<number> {
-    // 占位实现——后续接入 LLM API
-    // 真实实现: 3 个 Judge Agent 独立评估，取中位数
-    // 使用廉价模型 (doubao/minimax) 评估
+    // 如果有跨模型验证结果，用共识评分
+    if (input.crossModelResults && input.crossModelResults.length >= 2) {
+      return this.evaluateCrossModel(input.crossModelResults, details);
+    }
 
-    // 暂时基于 Layer 1+2 的综合启发式评分
+    // Fallback: 启发式评分
     const diffQuality = input.gitDiff ? Math.min(30, Math.round(input.gitDiff.length / 100)) : 15;
     const hasTests = input.testOutput && input.testOutput.includes('pass');
     const score = Math.min(30, diffQuality + (hasTests ? 10 : 0));
@@ -220,10 +223,115 @@ export class QualityJudge {
       passed: score >= 15,
       score,
       maxScore: 30,
-      message: `LLM Judge score: ${score}/30 (heuristic mode — LLM integration pending)`,
+      message: `LLM Judge score: ${score}/30 (heuristic mode)`,
     });
 
     return score;
+  }
+
+  // ============ 跨模型共识验证 ============
+
+  /**
+   * 用多个模型的独立产出做交叉验证
+   * 借鉴 Claude Octopus 的 Quorum 模式:
+   * - 计算各 pair 的关键词 Jaccard 重叠
+   * - overlap >= 0.6 → 共识达成，取质量最高的结果
+   * - overlap < 0.6 → 分歧，降分处理
+   */
+  private evaluateCrossModel(results: CrossModelResult[], details: QualityDetail[]): number {
+    const successResults = results.filter(r => r.status === 'success');
+
+    if (successResults.length < 2) {
+      const score = successResults.length === 1 ? 15 : 0;
+      details.push({
+        check: 'cross_model_consensus',
+        passed: false,
+        score,
+        maxScore: 30,
+        message: `Only ${successResults.length} model(s) succeeded, insufficient for consensus`,
+      });
+      return score;
+    }
+
+    // 计算 pairwise 关键词重叠
+    const overlaps: number[] = [];
+    for (let i = 0; i < successResults.length; i++) {
+      for (let j = i + 1; j < successResults.length; j++) {
+        const overlap = this.jaccardOverlap(
+          successResults[i].gitDiff || '',
+          successResults[j].gitDiff || '',
+        );
+        overlaps.push(overlap);
+      }
+    }
+
+    const avgOverlap = overlaps.reduce((a, b) => a + b, 0) / overlaps.length;
+    const consensus = avgOverlap >= 0.6;
+
+    // 质量分: 共识 → 高分，分歧 → 低分
+    const qualityScores = successResults.map(r => r.qualityScore);
+    const medianQuality = qualityScores.sort((a, b) => a - b)[Math.floor(qualityScores.length / 2)];
+    const normalizedQuality = Math.min(30, Math.round((medianQuality / 100) * 30));
+
+    const score = consensus
+      ? Math.min(30, normalizedQuality + 5)  // 共识加分
+      : Math.max(0, normalizedQuality - 10); // 分歧减分
+
+    details.push({
+      check: 'cross_model_consensus',
+      passed: consensus,
+      score,
+      maxScore: 30,
+      message: `${successResults.length} models, avg overlap=${(avgOverlap * 100).toFixed(1)}%, ` +
+               `consensus=${consensus ? 'YES' : 'NO'}, median quality=${medianQuality}`,
+    });
+
+    // 记录验证结果到 Redis
+    const verification: CrossModelVerification = {
+      taskId: results[0]?.agentId || 'unknown',
+      results: successResults,
+      keywordOverlap: avgOverlap,
+      consensus,
+      threshold: 0.6,
+      timestamp: Date.now(),
+    };
+    this.redis.xAdd('fsc:cross_model_verify', '*', {
+      payload: JSON.stringify(verification),
+      timestamp: Date.now().toString(),
+    }).catch(() => {}); // fire-and-forget
+
+    return score;
+  }
+
+  /**
+   * Jaccard 关键词重叠度
+   * 提取 diff 中的标识符关键词，计算交集/并集
+   * 借鉴 Octopus 的 _keyword_overlap()
+   */
+  private jaccardOverlap(textA: string, textB: string): number {
+    const extract = (text: string): Set<string> => {
+      const stopwords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+        'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
+        'may', 'might', 'shall', 'can', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
+        'from', 'as', 'into', 'through', 'during', 'before', 'after', 'and', 'but', 'or',
+        'not', 'no', 'if', 'then', 'else', 'this', 'that', 'it', 'its', 'diff', 'git']);
+      const words = text.toLowerCase().match(/[a-z_][a-z0-9_]{2,}/g) || [];
+      return new Set(words.filter(w => !stopwords.has(w)));
+    };
+
+    const setA = extract(textA);
+    const setB = extract(textB);
+
+    if (setA.size === 0 && setB.size === 0) return 1.0;
+    if (setA.size === 0 || setB.size === 0) return 0.0;
+
+    let intersection = 0;
+    setA.forEach(w => {
+      if (setB.has(w)) intersection++;
+    });
+
+    const union = setA.size + setB.size - intersection;
+    return union === 0 ? 0 : intersection / union;
   }
 
   /** 获取待审查队列长度 */
