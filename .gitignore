@@ -8,3 +8,12 @@ package-lock.json
 bun.lockb
 *.so
 *.dylib
+.gitnexus
+
+# Claude/OMC
+.claude/
+.omc/
+AGENTS.md
+
+# Rust build
+rust/*/target/

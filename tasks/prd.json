@@ -199,5 +199,30 @@
     }
   ],
   "passes": true,
-  "next_story": "story-7"
+  "next_story": "story-7",
+  "backlog": [
+    {
+      "id": "story-8",
+      "title": "Symphony 模式借鉴",
+      "status": "pending",
+      "source": "openai/symphony SPEC.md",
+      "tasks": [
+        {
+          "id": "task-8-1",
+          "description": "WORKFLOW.md 热重载 — 治理策略文件 file watcher，改完自动生效无需重启",
+          "status": "pending"
+        },
+        {
+          "id": "task-8-2",
+          "description": "Stall Detection — 基于事件活跃度的 Worker 卡死检测，替代简单 Docker timeout，指数退避重试",
+          "status": "pending"
+        },
+        {
+          "id": "task-8-3",
+          "description": "Reconciliation Loop — 任务状态与实际运行持续对账，清理幽灵任务，终态自动回收 workspace",
+          "status": "pending"
+        }
+      ]
+    }
+  ]
 }
