@@ -18,8 +18,10 @@ import { readFile, writeFile } from 'fs/promises';
 
 // ============ 配置 ============
 import { REDIS_HOST, REDIS_PORT, REDIS_PASSWORD } from '../config/redis';
+import { getActiveNodeIps } from '../config/network';
+
 const MEM_DIR = '.mem';
-const NODES = ['10.10.0.2', '10.10.0.3', '10.10.0.4'];
+const NODES = getActiveNodeIps(); // 动态获取 Tailscale 节点
 const CONSUMER_GROUP = 'memov-sync';
 const CONSUMER_NAME = `memov-${process.env.HOSTNAME || 'local'}`;
 const STREAM_KEY = 'fsc:mem_events';

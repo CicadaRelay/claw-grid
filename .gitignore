@@ -8,3 +8,19 @@ package-lock.json
 bun.lockb
 *.so
 *.dylib
+
+# 敏感文件
+*.key
+*.pem
+wg0.conf
+.memov.pid
+.claw-mesh.pid
+
+# 本地数据
+redis_data/
+qdrant_storage/
+.mem/
+
+# 构建产物
+bun.lock
+packages/
