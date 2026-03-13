@@ -18,10 +18,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - name: Install root dependencies
-        run: npm ci
+        run: npm install
 
       - name: Run root tests
         run: npm test
@@ -40,11 +39,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/claw-grid-dashboard/package-lock.json
 
       - name: Install dashboard dependencies
-        run: npm ci
+        run: npm install
 
       - name: Build dashboard
         run: npm run build
